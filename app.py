@@ -15,11 +15,7 @@ from pypdf import PdfReader
 from arca_ws import (ARCAError, CBTE_CODES, digits, generar_clave_y_csr, wsaa_login,
                      wsfe_ultimo_autorizado, wsfe_puntos_venta, wsfe_condiciones_iva_receptor,
                      wsfe_solicitar_cae)
-from fiscal_pdf import generar_pdf_factura
-try:
-    from fiscal_pdf import PDF_TEMPLATE_VERSION
-except ImportError:
-    PDF_TEMPLATE_VERSION = "PLANTILLA_PDF_SIN_VERSION"
+from fiscal_pdf_v3 import generar_pdf_factura, PDF_TEMPLATE_VERSION
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "control_cuentas.db"
@@ -1706,75 +1702,71 @@ def probar_conexion_arca(emisor_id):
     return ta, ptos
 
 
-def _safe_filename_part(value):
-    s = str(value or "").strip()
-    s = re.sub(r'[\\/:*?"<>|]+', ' ', s)
-    s = re.sub(r'\s+', ' ', s).strip(' .')
-    return s or "CLIENTE"
+
+def _safe_filename_piece(txt):
+    txt = str(txt or "").strip()
+    txt = re.sub(r'[\\/:*?"<>|]+', ' ', txt)
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    return txt or "CLIENTE"
 
 
-def nombre_pdf_factura(cliente_nombre, tipo_periodo, periodo_texto, fecha_emision):
-    cliente = _safe_filename_part(cliente_nombre)
-    tipo_periodo = str(tipo_periodo or "").strip()
-    periodo_texto = str(periodo_texto or "").strip()
-    fecha = str(fecha_emision or "").strip()
-    if tipo_periodo in ("Mes vigente", "Mes vencido") and periodo_texto:
-        periodo = periodo_texto.replace("/", "-")
-        return f"{cliente} - {periodo}.pdf"
+def _nombre_pdf_factura(comp, cliente_nombre):
+    cliente_archivo = _safe_filename_piece(cliente_nombre)
+    tipo_periodo_guardado = str(comp.get("tipo_periodo") or "")
+    if tipo_periodo_guardado in ("Mes vigente", "Mes vencido"):
+        periodo_archivo = str(comp.get("periodo_texto") or "").replace("/", "-").strip()
+        if not periodo_archivo:
+            periodo_archivo = str(comp.get("fecha_emision") or "")[:7].replace("-", "-")
+        return f"{cliente_archivo} - {periodo_archivo}.pdf"
     try:
-        fecha_fmt = datetime.strptime(fecha, "%Y-%m-%d").strftime("%d-%m-%Y")
+        fecha_archivo = datetime.strptime(str(comp.get("fecha_emision")), "%Y-%m-%d").strftime("%d-%m-%Y")
     except Exception:
-        fecha_fmt = fecha.replace("/", "-") or date.today().strftime("%d-%m-%Y")
-    return f"{cliente} - {fecha_fmt}.pdf"
+        fecha_archivo = str(comp.get("fecha_emision") or "FECHA").replace("/", "-")
+    return f"{cliente_archivo} - {fecha_archivo}.pdf"
 
 
-def _datos_pdf_comprobante(comprobante_id):
+def regenerar_pdf_autorizada(comprobante_id):
     row = query_df("""
         SELECT a.*, c.nombre cliente_nombre,c.cuit cliente_cuit,c.domicilio cliente_domicilio,
                c.condicion_iva_receptor_id,c.condicion_iva_receptor_desc,
-               e.id emisor_id,e.nombre emisor_nombre,e.cuit emisor_cuit,e.condicion_iva,
-               e.punto_venta emisor_punto_venta,e.domicilio_fiscal,e.ingresos_brutos,
-               e.inicio_actividades,e.regimen_iva,e.iva_alicuota,e.ambiente_arca,e.precios_incluyen_iva
+               e.nombre emisor_nombre,e.cuit emisor_cuit,e.condicion_iva,e.punto_venta AS emisor_punto_venta,
+               e.domicilio_fiscal,e.ingresos_brutos,e.inicio_actividades,e.regimen_iva,e.iva_alicuota,
+               e.ambiente_arca,e.precios_incluyen_iva
         FROM comprobantes_arca a
         JOIN clientes c ON c.id=a.cliente_id
         JOIN emisores e ON e.id=a.emisor_id
         WHERE a.id=?
     """, (comprobante_id,))
     if len(row) != 1:
-        raise ValueError("No se encontró el comprobante.")
-    r = row.iloc[0]
+        return False, "No se encontró el comprobante."
+    r = row.iloc[0].to_dict()
+    if str(r.get("estado_arca") or "").upper() != "AUTORIZADA" or not str(r.get("cae") or ""):
+        return False, "La factura todavía no está autorizada por ARCA."
+
     emisor = {
-        "id": r["emisor_id"], "nombre": r["emisor_nombre"], "cuit": r["emisor_cuit"],
-        "condicion_iva": r.get("condicion_iva"), "punto_venta": r.get("emisor_punto_venta"),
+        "id": r.get("emisor_id"), "nombre": r.get("emisor_nombre"), "cuit": r.get("emisor_cuit"),
+        "condicion_iva": r.get("condicion_iva"), "punto_venta": r.get("punto_venta") or r.get("emisor_punto_venta"),
         "domicilio_fiscal": r.get("domicilio_fiscal"), "ingresos_brutos": r.get("ingresos_brutos"),
         "inicio_actividades": r.get("inicio_actividades"), "regimen_iva": r.get("regimen_iva"),
         "iva_alicuota": r.get("iva_alicuota"), "ambiente_arca": r.get("ambiente_arca"),
         "precios_incluyen_iva": r.get("precios_incluyen_iva")
     }
     cliente = {
-        "id": r["cliente_id"], "nombre": r["cliente_nombre"], "cuit": r["cliente_cuit"],
+        "id": r.get("cliente_id"), "nombre": r.get("cliente_nombre"), "cuit": r.get("cliente_cuit"),
         "domicilio": r.get("cliente_domicilio"),
         "condicion_iva_receptor_id": r.get("condicion_iva_receptor_id"),
         "condicion_iva_receptor_desc": r.get("condicion_iva_receptor_desc")
     }
-    comp = r.to_dict()
-    total = float(comp.get("total") or 0)
-    comp["doc_tipo"] = _doc_receptor(cliente, total)[0]
-    items = query_df("SELECT * FROM comprobante_items WHERE comprobante_id=? ORDER BY id", (comprobante_id,)).to_dict("records")
-    return r, emisor, cliente, comp, items
-
-
-def regenerar_pdf_autorizado(comprobante_id):
-    r, emisor, cliente, comp, items = _datos_pdf_comprobante(comprobante_id)
-    if str(comp.get("estado_arca") or "").upper() != "AUTORIZADA" or not str(comp.get("cae") or ""):
-        return False, "La factura todavía no está autorizada por ARCA."
-    filename = nombre_pdf_factura(cliente.get("nombre"), comp.get("tipo_periodo"), comp.get("periodo_texto"), comp.get("fecha_emision"))
-    path = PDF_DIR / filename
-    generar_pdf_factura(path, emisor=emisor, cliente=cliente, comprobante=comp, items=items)
-    execute("UPDATE comprobantes_arca SET pdf_path=? WHERE id=?", (str(path), comprobante_id))
-    comp_ref = f"{int(comp.get('punto_venta') or emisor.get('punto_venta') or 0):05d}-{int(comp.get('numero_comprobante') or 0):08d}"
-    execute("UPDATE movimientos SET pdf_path=? WHERE cliente_id=? AND comprobante=?", (str(path), int(comp["cliente_id"]), comp_ref))
-    return True, f"PDF regenerado con plantilla {PDF_TEMPLATE_VERSION}: {filename}"
+    total = float(r.get("total") or 0)
+    r["doc_tipo"] = _doc_receptor(cliente, total)[0] or 99
+    items_df = query_df("SELECT * FROM comprobante_items WHERE comprobante_id=? ORDER BY id", (comprobante_id,))
+    items = items_df.to_dict("records")
+    pdf_path = PDF_DIR / _nombre_pdf_factura(r, r.get("cliente_nombre"))
+    generar_pdf_factura(pdf_path, emisor=emisor, cliente=cliente, comprobante=r, items=items)
+    execute("UPDATE comprobantes_arca SET pdf_path=?, arca_error=NULL WHERE id=?", (str(pdf_path), comprobante_id))
+    execute("UPDATE movimientos SET pdf_path=? WHERE comprobante LIKE ? AND cliente_id=?",
+            (str(pdf_path), f"ARCA-%-{int(r.get('punto_venta') or 0):05d}-{int(r.get('numero_comprobante') or 0):08d}", int(r.get('cliente_id'))))
+    return True, f"PDF regenerado con plantilla {PDF_TEMPLATE_VERSION}."
 
 
 def emitir_comprobante_arca(comprobante_id):
@@ -1856,7 +1848,7 @@ def emitir_comprobante_arca(comprobante_id):
         comp["doc_tipo"] = _doc_receptor(cliente, total)[0]
         items_df = query_df("SELECT * FROM comprobante_items WHERE comprobante_id=? ORDER BY id", (comprobante_id,))
         items = items_df.to_dict("records")
-        safe = nombre_pdf_factura(cliente.get("nombre"), comp.get("tipo_periodo"), comp.get("periodo_texto"), comp.get("fecha_emision"))
+        safe = _nombre_pdf_factura(comp, cliente.get("nombre"))
         pdf_path = PDF_DIR / safe
         try:
             generar_pdf_factura(pdf_path, emisor=emisor, cliente=cliente, comprobante=comp, items=items)
@@ -2058,6 +2050,7 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Emitir factura C")
     st.caption("Los tres emisores son monotributistas. El sistema sólo emite Factura C.")
+    st.caption(f"Plantilla PDF activa: {PDF_TEMPLATE_VERSION} · ORIGINAL + DUPLICADO + TRIPLICADO")
 
     emisores = get_emisores(True)
     if len(emisores) == 0:
@@ -2541,8 +2534,6 @@ with tabs[10]:
                 st.error(str(e))
 
 
-    st.caption(f"Plantilla PDF activa: **{PDF_TEMPLATE_VERSION}** · ORIGINAL + DUPLICADO + TRIPLICADO")
-
     st.divider()
     st.markdown("#### Facturas preparadas / emitidas")
     comps = query_df("""
@@ -2596,14 +2587,14 @@ with tabs[10]:
         sel_id = st.selectbox("Factura autorizada", autorizadas["id"].tolist(), key="mail_factura_sel")
         rr = autorizadas[autorizadas["id"] == sel_id].iloc[0]
         st.caption(f"Cliente: {rr['cliente']} · Email: {rr.get('email_facturacion') or 'sin configurar'}")
-        cdl, cregen, csend = st.columns(3)
+        cdl, csend = st.columns(2)
         p = str(rr.get("pdf_path") or "")
         if p and Path(p).exists():
             cdl.download_button("Descargar PDF", data=Path(p).read_bytes(), file_name=Path(p).name, mime="application/pdf", key=f"pdf_{sel_id}")
         else:
             cdl.info("PDF todavía no disponible")
-        if cregen.button("Regenerar PDF formato ARCA", key=f"regen_{sel_id}"):
-            ok, msg = regenerar_pdf_autorizado(int(sel_id))
+        if cdl.button("Regenerar PDF formato ARCA", key=f"regen_{sel_id}"):
+            ok, msg = regenerar_pdf_autorizada(int(sel_id))
             (st.success if ok else st.error)(msg)
             if ok:
                 st.rerun()
