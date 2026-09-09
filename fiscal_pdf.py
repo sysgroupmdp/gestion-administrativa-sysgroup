@@ -15,6 +15,7 @@ from reportlab.pdfgen import canvas
 
 CBTE_CODES = {"A": 1, "B": 6, "C": 11, "M": 51}
 COPIAS = ("ORIGINAL", "DUPLICADO", "TRIPLICADO")
+PDF_TEMPLATE_VERSION = "ARCA_TRIPLICADO_SSGROUP_V2"
 
 
 def _date_ar(value: Any) -> str:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import html
 import re
+import json
+import hashlib
 import subprocess
 import tempfile
 import time
@@ -107,7 +109,7 @@ def generar_clave_y_csr(cuit: str, organizacion: str, cn: str = "gestion-sysgrou
 def _build_tra(service: str = "wsfe") -> bytes:
     now = datetime.now(timezone.utc)
     gen = now - timedelta(minutes=5)
-    exp = now + timedelta(minutes=15)
+    exp = now + timedelta(hours=11, minutes=50)
     uid = int(time.time())
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -147,6 +149,73 @@ def _sign_cms(tra: bytes, cert_pem: bytes, key_pem: bytes) -> str:
         return base64.b64encode(cms_path.read_bytes()).decode("ascii")
 
 
+_CACHE_FILE = Path(__file__).resolve().parent / ".arca_wsaa_cache.json"
+
+
+def _cert_fingerprint(cert_pem: bytes) -> str:
+    return hashlib.sha256(cert_pem).hexdigest()
+
+
+def _parse_expiration(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _ticket_is_valid(ticket: "TicketAcceso", safety_minutes: int = 5) -> bool:
+    exp = _parse_expiration(ticket.expiration_time)
+    if exp is None:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp > datetime.now(timezone.utc) + timedelta(minutes=safety_minutes)
+
+
+def _load_ticket_cache() -> Dict[str, Dict[str, str]]:
+    try:
+        if _CACHE_FILE.exists():
+            data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_ticket_cache(cache: Dict[str, Dict[str, str]]) -> None:
+    try:
+        _CACHE_FILE.write_text(json.dumps(cache), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _cache_key(cert_pem: bytes, ambiente: str, service: str) -> str:
+    return f"{ambiente.upper()}|{service}|{_cert_fingerprint(cert_pem)}"
+
+
+def _cached_ticket(cert_pem: bytes, ambiente: str, service: str) -> Optional["TicketAcceso"]:
+    row = _load_ticket_cache().get(_cache_key(cert_pem, ambiente, service))
+    if not row:
+        return None
+    try:
+        ticket = TicketAcceso(token=str(row["token"]), sign=str(row["sign"]), expiration_time=str(row["expiration_time"]))
+    except Exception:
+        return None
+    return ticket if _ticket_is_valid(ticket) else None
+
+
+def _store_ticket(cert_pem: bytes, ambiente: str, service: str, ticket: "TicketAcceso") -> None:
+    cache = _load_ticket_cache()
+    cache[_cache_key(cert_pem, ambiente, service)] = {
+        "token": ticket.token,
+        "sign": ticket.sign,
+        "expiration_time": ticket.expiration_time,
+    }
+    _save_ticket_cache(cache)
+
+
 @dataclass
 class TicketAcceso:
     token: str
@@ -155,9 +224,15 @@ class TicketAcceso:
 
 
 def wsaa_login(cert_pem: bytes, key_pem: bytes, ambiente: str = "PRODUCCION", service: str = "wsfe") -> TicketAcceso:
+    """Obtiene un TA de WSAA y lo reutiliza hasta cerca de su vencimiento."""
     ambiente = ambiente.upper()
     if ambiente not in WSAA_URLS:
         raise ARCAError("Ambiente ARCA inválido.")
+
+    cached = _cached_ticket(cert_pem, ambiente, service)
+    if cached is not None:
+        return cached
+
     cms = _sign_cms(_build_tra(service), cert_pem, key_pem)
     envelope = f'''<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsaa="http://wsaa.view.sua.dvadac.desein.afip.gov">
@@ -171,6 +246,12 @@ def wsaa_login(cert_pem: bytes, key_pem: bytes, ambiente: str = "PRODUCCION", se
         headers={"Content-Type": "text/xml;charset=UTF-8", "SOAPAction": "urn:LoginCms"},
         timeout=45,
     )
+    if resp.status_code >= 400 and "alreadyAuthenticated" in resp.text:
+        raise ARCAError(
+            "ARCA ya tiene un Ticket de Acceso vigente para este certificado. "
+            "La versión anterior de la app no lo guardó. Esperá a que venza ese ticket y volvé a intentar; "
+            "desde esta versión el sistema lo guarda y reutiliza automáticamente."
+        )
     root = _parse_soap(resp)
     result = _find_text(root, "loginCmsReturn")
     if not result:
@@ -184,8 +265,9 @@ def wsaa_login(cert_pem: bytes, key_pem: bytes, ambiente: str = "PRODUCCION", se
     expiration = _find_text(ticket_xml, "expirationTime") or ""
     if not token or not sign:
         raise ARCAError("No se pudieron extraer Token/Sign del Ticket de Acceso.")
-    return TicketAcceso(token=token, sign=sign, expiration_time=expiration)
-
+    ticket = TicketAcceso(token=token, sign=sign, expiration_time=expiration)
+    _store_ticket(cert_pem, ambiente, service, ticket)
+    return ticket
 
 def _auth_xml(ticket: TicketAcceso, cuit: str) -> str:
     cuit_d = digits(cuit)
