@@ -15,7 +15,11 @@ from pypdf import PdfReader
 from arca_ws import (ARCAError, CBTE_CODES, digits, generar_clave_y_csr, wsaa_login,
                      wsfe_ultimo_autorizado, wsfe_puntos_venta, wsfe_condiciones_iva_receptor,
                      wsfe_solicitar_cae)
-from fiscal_pdf import generar_pdf_factura, PDF_TEMPLATE_VERSION
+from fiscal_pdf import generar_pdf_factura
+try:
+    from fiscal_pdf import PDF_TEMPLATE_VERSION
+except ImportError:
+    PDF_TEMPLATE_VERSION = "PLANTILLA_PDF_SIN_VERSION"
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "control_cuentas.db"
