@@ -6,10 +6,16 @@ from datetime import date, datetime
 import pandas as pd
 import re
 import io
+import base64
 import smtplib
 import ssl
+from datetime import timedelta
 from email.message import EmailMessage
 from pypdf import PdfReader
+from arca_ws import (ARCAError, CBTE_CODES, digits, generar_clave_y_csr, wsaa_login,
+                     wsfe_ultimo_autorizado, wsfe_puntos_venta, wsfe_condiciones_iva_receptor,
+                     wsfe_solicitar_cae)
+from fiscal_pdf import generar_pdf_factura
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "control_cuentas.db"
@@ -17,6 +23,39 @@ PDF_DIR = APP_DIR / "facturas"
 PDF_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(page_title="S&S Group · Gestión Administrativa", page_icon="📊", layout="wide")
+
+
+def _secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def app_password_configurada():
+    return bool(_secret("app_password"))
+
+
+def acceso_autorizado():
+    expected = _secret("app_password")
+    if not expected:
+        return True
+    if st.session_state.get("authenticated"):
+        return True
+    st.title("S&S Group · Gestión Administrativa")
+    st.subheader("Acceso privado")
+    password = st.text_input("Contraseña", type="password")
+    if st.button("Ingresar", type="primary"):
+        if password == expected:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Contraseña incorrecta.")
+    return False
+
+
+if not acceso_autorizado():
+    st.stop()
 
 def get_conn():
     conn = sqlite3.connect(
@@ -161,6 +200,33 @@ def init_db():
         )
     """)
 
+    def add_col(table, name, definition):
+        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if name not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    # Datos fiscales del emisor
+    add_col("emisores", "domicilio_fiscal", "TEXT")
+    add_col("emisores", "ingresos_brutos", "TEXT")
+    add_col("emisores", "inicio_actividades", "TEXT")
+    add_col("emisores", "regimen_iva", "TEXT")
+    add_col("emisores", "iva_alicuota", "REAL DEFAULT 21")
+    add_col("emisores", "ambiente_arca", "TEXT DEFAULT 'HOMOLOGACION'")
+    add_col("emisores", "precios_incluyen_iva", "INTEGER DEFAULT 1")
+
+    # Datos fiscales del receptor
+    add_col("clientes", "domicilio", "TEXT")
+    add_col("clientes", "condicion_iva_receptor_id", "INTEGER")
+    add_col("clientes", "condicion_iva_receptor_desc", "TEXT")
+
+    # Resultado fiscal del comprobante
+    add_col("comprobantes_arca", "cbte_tipo_codigo", "INTEGER")
+    add_col("comprobantes_arca", "imp_neto", "REAL")
+    add_col("comprobantes_arca", "imp_iva", "REAL")
+    add_col("comprobantes_arca", "fecha_vto_pago", "TEXT")
+    add_col("comprobantes_arca", "arca_observaciones", "TEXT")
+    add_col("comprobantes_arca", "arca_error", "TEXT")
+
     conn.commit()
     conn.close()
 
@@ -189,18 +255,1236 @@ def get_clientes(active_only=True):
     where = "WHERE activo=1" if active_only else ""
     return query_df(f"SELECT * FROM clientes {where} ORDER BY nombre")
 
-def ensure_demo_data():
-    if len(get_clientes(False)) == 0:
-        demo = [
-            ("JUAREZ CESAR", None, "Aviso de pago", 760000),
-            ("EULOGIO CONDORI", None, "Aviso de pago", 320000),
-            ("ROJAS MARTIN", None, "Aviso de pago", 240000),
-            ("GAUTHIER WALTER", None, "Aviso de pago", 400000),
-            ("PROSEGUR S.A.", None, "Factura", 0),
-        ]
-        for n,c,m,h in demo:
-            execute("""INSERT INTO clientes(nombre,cuit,modalidad,honorario,vigente_desde,dia_generacion,activo)
-                       VALUES(?,?,?,?,?,?,1)""",(n,c,m,h,date.today().replace(day=1).isoformat(),1))
+
+INITIAL_CLIENTS = [{'nombre': 'MAGLIANO MARCELO',
+  'cuit': None,
+  'modalidad': 'Factura',
+  'honorario': 0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'JUAREZ CESAR',
+  'cuit': None,
+  'modalidad': 'Aviso de pago',
+  'honorario': 760000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': 'Honorario tomado del último Aviso de pago detectado'},
+ {'nombre': 'EULOGIO CONDORI',
+  'cuit': None,
+  'modalidad': 'Aviso de pago',
+  'honorario': 320000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': 'Honorario tomado del último Aviso de pago detectado'},
+ {'nombre': 'ROJAS MARTIN',
+  'cuit': None,
+  'modalidad': 'Aviso de pago',
+  'honorario': 240000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': 'Honorario tomado del último Aviso de pago detectado'},
+ {'nombre': 'BIOPARQUE BATAN 2023 S.A.',
+  'cuit': '30718359453',
+  'modalidad': 'Factura',
+  'honorario': 210000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'ALTURAS MS MIRAMAR S.R.L',
+  'cuit': '30718579763',
+  'modalidad': 'Factura',
+  'honorario': 0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'GAUTHIER WALTER',
+  'cuit': None,
+  'modalidad': 'Aviso de pago',
+  'honorario': 400000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': 'Honorario tomado del último Aviso de pago detectado'},
+ {'nombre': 'COOPERATIVA DE TRABAJO COOPECONS LTDA',
+  'cuit': '30717179680',
+  'modalidad': 'Factura',
+  'honorario': 230000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'OBISPADO DE MAR DEL PLATA',
+  'cuit': '30542337555',
+  'modalidad': 'Factura',
+  'honorario': 89000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'COOPERATIVA DE TRABAJO EL CHE LIMITADA',
+  'cuit': '33711078199',
+  'modalidad': 'Factura',
+  'honorario': 89000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'COOPERATIVA DE TRABAJO SEGUIMOS LUCHANDO LTDA',
+  'cuit': '30714199753',
+  'modalidad': 'Factura',
+  'honorario': 200000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'INVERSORA EN CONSTRUCCIONES DE COBO S.A.',
+  'cuit': '30711651280',
+  'modalidad': 'Aviso de pago',
+  'honorario': 460000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': 'Honorario tomado del último Aviso de pago detectado'},
+ {'nombre': 'GALVAN',
+  'cuit': None,
+  'modalidad': 'Factura',
+  'honorario': 250000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'SINDICATO DE QUIMICOS',
+  'cuit': '30532700414',
+  'modalidad': 'Factura',
+  'honorario': 192000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'INFINIT',
+  'cuit': '30711262713',
+  'modalidad': 'Factura',
+  'honorario': 108000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'GENARO Y ANDRES DE STEFANO',
+  'cuit': '30500689826',
+  'modalidad': 'Factura',
+  'honorario': 162000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'RUCANEDA S.A.',
+  'cuit': '30712269134',
+  'modalidad': 'Factura',
+  'honorario': 206000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'SARAZOLA',
+  'cuit': None,
+  'modalidad': 'Factura',
+  'honorario': 150000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'RBC CONSTRUCCIONES',
+  'cuit': '6 MONOTRIBUTISTAS',
+  'modalidad': 'Factura',
+  'honorario': 400000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'FIDEICOMISO DAPROTIS 4156 MAR DEL PLATA',
+  'cuit': '30717979296',
+  'modalidad': 'Factura',
+  'honorario': 130000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'OESTE (LAURA FARIAS)',
+  'cuit': '27149714826',
+  'modalidad': 'Factura',
+  'honorario': 130000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'DISTRISUPER S.R.L.',
+  'cuit': '30609249206',
+  'modalidad': 'Factura',
+  'honorario': 190000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'DIMES S.A.',
+  'cuit': '33715613439',
+  'modalidad': 'Factura',
+  'honorario': 101000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'ROCA 2936 MAR DEL PLATA S.A.',
+  'cuit': '30717026965',
+  'modalidad': 'Factura',
+  'honorario': 190000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'RAMOS SANCHEZ ALCIDES',
+  'cuit': None,
+  'modalidad': 'Aviso de pago',
+  'honorario': 450000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': 'Honorario tomado del último Aviso de pago detectado'},
+ {'nombre': 'GEHIE GASTRONOMICA SRL (alito)',
+  'cuit': '30681375135',
+  'modalidad': 'Factura',
+  'honorario': 170000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'GUSTAVO RIVERA PLOMERO',
+  'cuit': None,
+  'modalidad': 'Factura',
+  'honorario': 280000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'BARD ATILIO RENE',
+  'cuit': '20047463514',
+  'modalidad': 'Factura',
+  'honorario': 0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'MAGGI MARCELO Y MAGGI MAURICIO SOC …',
+  'cuit': '30688684028',
+  'modalidad': 'Factura',
+  'honorario': 350000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'CRUZ GEORGE',
+  'cuit': None,
+  'modalidad': 'Factura',
+  'honorario': 230000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'MONDEGO DA GUARDA S.A.',
+  'cuit': '30716517361',
+  'modalidad': 'Factura',
+  'honorario': 350000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'GRUPO BOREAS S.R.L.',
+  'cuit': '30714816981',
+  'modalidad': 'Factura',
+  'honorario': 200000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'COOK MASTER S.A.',
+  'cuit': '30708214368',
+  'modalidad': 'Factura',
+  'honorario': 680000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'UP EXPLANADA S.A.',
+  'cuit': '33718243829',
+  'modalidad': 'Factura',
+  'honorario': 170000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'PEZZANA DIEGO',
+  'cuit': '20259572453',
+  'modalidad': 'Factura',
+  'honorario': 200000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'LUBRIEL SRL',
+  'cuit': '30711294704',
+  'modalidad': 'Factura',
+  'honorario': 195000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'MANALER S.A.',
+  'cuit': '30716570440',
+  'modalidad': 'Factura',
+  'honorario': 0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'LOGISMAR S.R.L.',
+  'cuit': '30708043636',
+  'modalidad': 'Factura',
+  'honorario': 145000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'USAI ANALIA USAI GABRIELA USAI ESTEBAN S.H.',
+  'cuit': '33636629559',
+  'modalidad': 'Factura',
+  'honorario': 83000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'ANGELICO CORP',
+  'cuit': '30718290747',
+  'modalidad': 'Factura',
+  'honorario': 0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'PROSEGUR S.A.',
+  'cuit': '30575170125',
+  'modalidad': 'Factura',
+  'honorario': 238000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'JUNCADELLA',
+  'cuit': '30546969874',
+  'modalidad': 'Factura',
+  'honorario': 109500.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None},
+ {'nombre': 'MADRID',
+  'cuit': None,
+  'modalidad': 'Aviso de pago',
+  'honorario': 230000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': 'Honorario tomado del último Aviso de pago detectado'},
+ {'nombre': 'CAPARARO',
+  'cuit': '23272137404',
+  'modalidad': 'Factura',
+  'honorario': 170000.0,
+  'vigente_desde': '2026-09-01',
+  'dia_generacion': 1,
+  'activo': 1,
+  'observaciones': None}]
+
+INITIAL_MOVEMENTS = [{'fecha': '2025-12-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 163000.0,
+  'periodo': '2025-12-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 1},
+ {'fecha': '2026-01-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 163000.0,
+  'periodo': '2026-01-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 2},
+ {'fecha': '2026-01-05',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -163000.0,
+  'periodo': '2026-01-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 3},
+ {'fecha': '2026-02-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 163000.0,
+  'periodo': '2026-02-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 4},
+ {'fecha': '2026-02-20',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -163000.0,
+  'periodo': '2026-02-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 5},
+ {'fecha': '2026-03-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 163000.0,
+  'periodo': '2026-03-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 6},
+ {'fecha': '2026-03-02',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -163000.0,
+  'periodo': '2026-03-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 7},
+ {'fecha': '2026-04-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 163000.0,
+  'periodo': '2026-04-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 8},
+ {'fecha': '2026-04-01',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 680000.0,
+  'periodo': '2026-04-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 9},
+ {'fecha': '2026-05-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 163000.0,
+  'periodo': '2026-05-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 10},
+ {'fecha': '2026-05-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -163000.0,
+  'periodo': '2026-05-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 11},
+ {'fecha': '2026-05-04',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 680000.0,
+  'periodo': '2026-05-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 12},
+ {'fecha': '2026-05-10',
+  'cliente': 'MADRID',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 230000.0,
+  'periodo': '2026-05-01',
+  'origen': 'MADRID',
+  'comprobante': None,
+  'estado': None,
+  'seq': 13},
+ {'fecha': '2026-05-20',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -680000.0,
+  'periodo': '2026-05-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 14},
+ {'fecha': '2026-05-26',
+  'cliente': 'MADRID',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -230000.0,
+  'periodo': '2026-05-01',
+  'origen': 'MADRID',
+  'comprobante': None,
+  'estado': None,
+  'seq': 15},
+ {'fecha': '2026-06-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 192000.0,
+  'periodo': '2026-06-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 16},
+ {'fecha': '2026-06-01',
+  'cliente': 'INFINIT',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 130000.0,
+  'periodo': '2026-06-01',
+  'origen': 'INFINIT',
+  'comprobante': None,
+  'estado': None,
+  'seq': 17},
+ {'fecha': '2026-06-01',
+  'cliente': 'PEZZANA DIEGO',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 200000.0,
+  'periodo': '2026-06-01',
+  'origen': 'PEZZANA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 18},
+ {'fecha': '2026-06-01',
+  'cliente': 'PROSEGUR S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 238000.0,
+  'periodo': '2026-06-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 19},
+ {'fecha': '2026-06-01',
+  'cliente': 'JUNCADELLA',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 238000.0,
+  'periodo': '2026-06-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 20},
+ {'fecha': '2026-06-05',
+  'cliente': 'ROJAS MARTIN',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 240000.0,
+  'periodo': '2026-06-01',
+  'origen': 'MARTIN ROJAS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 21},
+ {'fecha': '2026-06-10',
+  'cliente': 'INFINIT',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -130000.0,
+  'periodo': '2026-06-01',
+  'origen': 'INFINIT',
+  'comprobante': None,
+  'estado': None,
+  'seq': 22},
+ {'fecha': '2026-06-20',
+  'cliente': 'MADRID',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 230000.0,
+  'periodo': '2026-06-01',
+  'origen': 'MADRID',
+  'comprobante': None,
+  'estado': None,
+  'seq': 23},
+ {'fecha': '2026-06-25',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 680000.0,
+  'periodo': '2026-06-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 24},
+ {'fecha': '2026-07-01',
+  'cliente': 'EULOGIO CONDORI',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 360000.0,
+  'periodo': '2026-07-01',
+  'origen': 'EULOGIO',
+  'comprobante': None,
+  'estado': None,
+  'seq': 25},
+ {'fecha': '2026-07-01',
+  'cliente': 'EULOGIO CONDORI',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -360000.0,
+  'periodo': '2026-07-01',
+  'origen': 'EULOGIO',
+  'comprobante': None,
+  'estado': None,
+  'seq': 26},
+ {'fecha': '2026-07-01',
+  'cliente': 'ROJAS MARTIN',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 240000.0,
+  'periodo': '2026-07-01',
+  'origen': 'MARTIN ROJAS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 27},
+ {'fecha': '2026-07-01',
+  'cliente': 'ALTURAS MS MIRAMAR S.R.L',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 230000.0,
+  'periodo': '2026-07-01',
+  'origen': 'ALTURAS MS MIRAMAR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 28},
+ {'fecha': '2026-07-01',
+  'cliente': 'GAUTHIER WALTER',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 400000.0,
+  'periodo': '2026-07-01',
+  'origen': 'GAUTHIER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 29},
+ {'fecha': '2026-07-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 192000.0,
+  'periodo': '2026-07-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 30},
+ {'fecha': '2026-07-01',
+  'cliente': 'INFINIT',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 130000.0,
+  'periodo': '2026-07-01',
+  'origen': 'INFINIT',
+  'comprobante': None,
+  'estado': None,
+  'seq': 31},
+ {'fecha': '2026-07-01',
+  'cliente': 'RUCANEDA S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 206000.0,
+  'periodo': '2026-07-01',
+  'origen': 'RUCANEDA SA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 32},
+ {'fecha': '2026-07-01',
+  'cliente': 'PEZZANA DIEGO',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 200000.0,
+  'periodo': '2026-07-01',
+  'origen': 'PEZZANA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 33},
+ {'fecha': '2026-07-01',
+  'cliente': 'PEZZANA DIEGO',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'PS 51',
+  'importe': 230000.0,
+  'periodo': '2026-07-01',
+  'origen': 'PEZZANA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 34},
+ {'fecha': '2026-07-01',
+  'cliente': 'ANGELICO CORP',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 760000.0,
+  'periodo': '2026-07-01',
+  'origen': 'ANGELICO CORP',
+  'comprobante': None,
+  'estado': None,
+  'seq': 35},
+ {'fecha': '2026-07-01',
+  'cliente': 'PROSEGUR S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 238000.0,
+  'periodo': '2026-07-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 36},
+ {'fecha': '2026-07-01',
+  'cliente': 'JUNCADELLA',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 238000.0,
+  'periodo': '2026-07-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 37},
+ {'fecha': '2026-07-10',
+  'cliente': 'ROJAS MARTIN',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -200000.0,
+  'periodo': '2026-07-01',
+  'origen': 'MARTIN ROJAS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 38},
+ {'fecha': '2026-07-10',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -335000.0,
+  'periodo': '2026-07-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 39},
+ {'fecha': '2026-07-10',
+  'cliente': 'PEZZANA DIEGO',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -300000.0,
+  'periodo': '2026-07-01',
+  'origen': 'PEZZANA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 40},
+ {'fecha': '2026-07-18',
+  'cliente': 'INFINIT',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -130000.0,
+  'periodo': '2026-07-01',
+  'origen': 'INFINIT',
+  'comprobante': None,
+  'estado': None,
+  'seq': 41},
+ {'fecha': '2026-07-20',
+  'cliente': 'MADRID',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 230000.0,
+  'periodo': '2026-07-01',
+  'origen': 'MADRID',
+  'comprobante': None,
+  'estado': None,
+  'seq': 42},
+ {'fecha': '2026-08-01',
+  'cliente': 'JUAREZ CESAR',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 760000.0,
+  'periodo': '2026-08-01',
+  'origen': 'JUAREZ',
+  'comprobante': None,
+  'estado': None,
+  'seq': 43},
+ {'fecha': '2026-08-01',
+  'cliente': 'EULOGIO CONDORI',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 320000.0,
+  'periodo': '2026-08-01',
+  'origen': 'EULOGIO',
+  'comprobante': None,
+  'estado': None,
+  'seq': 44},
+ {'fecha': '2026-08-01',
+  'cliente': 'BIOPARQUE BATAN 2023 S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 245000.0,
+  'periodo': '2026-08-01',
+  'origen': 'BIOPARQUE BATAN',
+  'comprobante': None,
+  'estado': None,
+  'seq': 45},
+ {'fecha': '2026-08-01',
+  'cliente': 'ALTURAS MS MIRAMAR S.R.L',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 460000.0,
+  'periodo': '2026-08-01',
+  'origen': 'ALTURAS MS MIRAMAR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 46},
+ {'fecha': '2026-08-01',
+  'cliente': 'INVERSORA EN CONSTRUCCIONES DE COBO S.A.',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'AVISO DE PAGO',
+  'importe': 460000.0,
+  'periodo': '2026-08-01',
+  'origen': 'AURORA DEL MAR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 47},
+ {'fecha': '2026-08-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 192000.0,
+  'periodo': '2026-08-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 48},
+ {'fecha': '2026-08-01',
+  'cliente': 'SINDICATO DE QUIMICOS',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -192000.0,
+  'periodo': '2026-08-01',
+  'origen': 'QUIMICOS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 49},
+ {'fecha': '2026-08-01',
+  'cliente': 'INFINIT',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 130000.0,
+  'periodo': '2026-08-01',
+  'origen': 'INFINIT',
+  'comprobante': None,
+  'estado': None,
+  'seq': 50},
+ {'fecha': '2026-08-01',
+  'cliente': 'GENARO Y ANDRES DE STEFANO',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 192000.0,
+  'periodo': '2026-08-01',
+  'origen': 'DE STEFANO SA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 51},
+ {'fecha': '2026-08-01',
+  'cliente': 'RUCANEDA S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 206000.0,
+  'periodo': '2026-08-01',
+  'origen': 'RUCANEDA SA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 52},
+ {'fecha': '2026-08-01',
+  'cliente': 'SARAZOLA',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'SALDO A LA FECHA',
+  'importe': 550000.0,
+  'periodo': '2026-08-01',
+  'origen': 'SARAZOLA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 53},
+ {'fecha': '2026-08-01',
+  'cliente': 'RBC CONSTRUCCIONES',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 400000.0,
+  'periodo': '2026-08-01',
+  'origen': 'RBC CONSTRUCCIONES',
+  'comprobante': None,
+  'estado': None,
+  'seq': 54},
+ {'fecha': '2026-08-01',
+  'cliente': 'FIDEICOMISO DAPROTIS 4156 MAR DEL PLATA',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 130000.0,
+  'periodo': '2026-08-01',
+  'origen': 'CASA VERDE',
+  'comprobante': None,
+  'estado': None,
+  'seq': 55},
+ {'fecha': '2026-08-01',
+  'cliente': 'RAMOS SANCHEZ ALCIDES',
+  'tipo': 'Aviso de pago',
+  'descripcion': 'Aviso de pago',
+  'importe': 450000.0,
+  'periodo': '2026-08-01',
+  'origen': 'RAMOS SANCHEZ',
+  'comprobante': None,
+  'estado': None,
+  'seq': 56},
+ {'fecha': '2026-08-01',
+  'cliente': 'GEHIE GASTRONOMICA SRL (alito)',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 170000.0,
+  'periodo': '2026-08-01',
+  'origen': 'ALITO',
+  'comprobante': None,
+  'estado': None,
+  'seq': 57},
+ {'fecha': '2026-08-01',
+  'cliente': 'BARD ATILIO RENE',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 410000.0,
+  'periodo': '2026-08-01',
+  'origen': 'BARD',
+  'comprobante': None,
+  'estado': None,
+  'seq': 58},
+ {'fecha': '2026-08-01',
+  'cliente': 'MAGGI MARCELO Y MAGGI MAURICIO SOC …',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 350000.0,
+  'periodo': '2026-08-01',
+  'origen': 'MAGGI',
+  'comprobante': None,
+  'estado': None,
+  'seq': 59},
+ {'fecha': '2026-08-01',
+  'cliente': 'MONDEGO DA GUARDA S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 350000.0,
+  'periodo': '2026-08-01',
+  'origen': 'MONDEGO DA GUARDA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 60},
+ {'fecha': '2026-08-01',
+  'cliente': 'GRUPO BOREAS S.R.L.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 200000.0,
+  'periodo': '2026-08-01',
+  'origen': 'BOREAS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 61},
+ {'fecha': '2026-08-01',
+  'cliente': 'PEZZANA DIEGO',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 380000.0,
+  'periodo': '2026-08-01',
+  'origen': 'PEZZANA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 62},
+ {'fecha': '2026-08-01',
+  'cliente': 'ANGELICO CORP',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 380000.0,
+  'periodo': '2026-08-01',
+  'origen': 'ANGELICO CORP',
+  'comprobante': None,
+  'estado': None,
+  'seq': 63},
+ {'fecha': '2026-08-01',
+  'cliente': 'PROSEGUR S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 238000.0,
+  'periodo': '2026-08-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 64},
+ {'fecha': '2026-08-01',
+  'cliente': 'JUNCADELLA',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Emisión de factura',
+  'importe': 238000.0,
+  'periodo': '2026-08-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 65},
+ {'fecha': '2026-08-02',
+  'cliente': 'FIDEICOMISO DAPROTIS 4156 MAR DEL PLATA',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -130000.0,
+  'periodo': '2026-08-01',
+  'origen': 'CASA VERDE',
+  'comprobante': None,
+  'estado': None,
+  'seq': 66},
+ {'fecha': '2026-08-03',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -680000.0,
+  'periodo': '2026-08-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 67},
+ {'fecha': '2026-08-06',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 680000.0,
+  'periodo': '2026-08-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 68},
+ {'fecha': '2026-08-06',
+  'cliente': 'PROSEGUR S.A.',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -238000.0,
+  'periodo': '2026-08-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 69},
+ {'fecha': '2026-08-06',
+  'cliente': 'JUNCADELLA',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -238000.0,
+  'periodo': '2026-08-01',
+  'origen': 'PROSEGUR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 70},
+ {'fecha': '2026-08-10',
+  'cliente': 'INFINIT',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -130000.0,
+  'periodo': '2026-08-01',
+  'origen': 'INFINIT',
+  'comprobante': None,
+  'estado': None,
+  'seq': 71},
+ {'fecha': '2026-08-11',
+  'cliente': 'GENARO Y ANDRES DE STEFANO',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -192000.0,
+  'periodo': '2026-08-01',
+  'origen': 'DE STEFANO SA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 72},
+ {'fecha': '2026-08-20',
+  'cliente': 'BIOPARQUE BATAN 2023 S.A.',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -245000.0,
+  'periodo': '2026-08-01',
+  'origen': 'BIOPARQUE BATAN',
+  'comprobante': None,
+  'estado': None,
+  'seq': 73},
+ {'fecha': '2026-08-20',
+  'cliente': 'INVERSORA EN CONSTRUCCIONES DE COBO S.A.',
+  'tipo': 'Pago',
+  'descripcion': 'Pago',
+  'importe': -460000.0,
+  'periodo': '2026-08-01',
+  'origen': 'AURORA DEL MAR',
+  'comprobante': None,
+  'estado': None,
+  'seq': 74},
+ {'fecha': '2026-08-20',
+  'cliente': 'SARAZOLA',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -200000.0,
+  'periodo': '2026-08-01',
+  'origen': 'SARAZOLA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 75},
+ {'fecha': '2026-08-20',
+  'cliente': 'RBC CONSTRUCCIONES',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -400000.0,
+  'periodo': '2026-08-01',
+  'origen': 'RBC CONSTRUCCIONES',
+  'comprobante': None,
+  'estado': None,
+  'seq': 76},
+ {'fecha': '2026-08-20',
+  'cliente': 'MAGGI MARCELO Y MAGGI MAURICIO SOC …',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -350000.0,
+  'periodo': '2026-08-01',
+  'origen': 'MAGGI',
+  'comprobante': None,
+  'estado': None,
+  'seq': 77},
+ {'fecha': '2026-08-20',
+  'cliente': 'MONDEGO DA GUARDA S.A.',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -350000.0,
+  'periodo': '2026-08-01',
+  'origen': 'MONDEGO DA GUARDA',
+  'comprobante': None,
+  'estado': None,
+  'seq': 78},
+ {'fecha': '2026-08-20',
+  'cliente': 'GRUPO BOREAS S.R.L.',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -200000.0,
+  'periodo': '2026-08-01',
+  'origen': 'BOREAS',
+  'comprobante': None,
+  'estado': None,
+  'seq': 79},
+ {'fecha': '2026-08-20',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -680000.0,
+  'periodo': '2026-08-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 80},
+ {'fecha': '2026-08-20',
+  'cliente': 'ANGELICO CORP',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -760000.0,
+  'periodo': '2026-08-01',
+  'origen': 'ANGELICO CORP',
+  'comprobante': None,
+  'estado': None,
+  'seq': 81},
+ {'fecha': '2026-08-20',
+  'cliente': 'MADRID',
+  'tipo': 'Pago',
+  'descripcion': 'PAGO',
+  'importe': -230000.0,
+  'periodo': '2026-08-01',
+  'origen': 'MADRID',
+  'comprobante': None,
+  'estado': None,
+  'seq': 82},
+ {'fecha': '2027-07-01',
+  'cliente': 'COOK MASTER S.A.',
+  'tipo': 'Factura/Cargo',
+  'descripcion': 'Facturación',
+  'importe': 680000.0,
+  'periodo': '2027-07-01',
+  'origen': 'COOK MASTER',
+  'comprobante': None,
+  'estado': None,
+  'seq': 83}]
+
+def ensure_initial_data():
+    """Carga una sola vez la base real migrada del control de cuentas anterior."""
+    conn = get_conn()
+    current = conn.execute("SELECT id,nombre FROM clientes ORDER BY id").fetchall()
+    current_names = {r["nombre"] for r in current}
+    demo_names = {"JUAREZ CESAR","EULOGIO CONDORI","ROJAS MARTIN","GAUTHIER WALTER","PROSEGUR S.A."}
+    should_seed = (len(current) == 0) or (len(current) <= 5 and current_names.issubset(demo_names))
+    if not should_seed:
+        conn.close()
+        return
+
+    conn.execute("DELETE FROM movimientos")
+    conn.execute("DELETE FROM honorarios")
+    conn.execute("DELETE FROM clientes")
+
+    for c in INITIAL_CLIENTS:
+        conn.execute("""
+            INSERT INTO clientes(
+                nombre,cuit,modalidad,honorario,vigente_desde,dia_generacion,activo,observaciones
+            ) VALUES(?,?,?,?,?,?,?,?)
+        """, (
+            c["nombre"], c["cuit"], c["modalidad"], c["honorario"], c["vigente_desde"],
+            c["dia_generacion"], c["activo"], c["observaciones"]
+        ))
+
+    ids = {r["nombre"]: r["id"] for r in conn.execute("SELECT id,nombre FROM clientes").fetchall()}
+    now = datetime.now().isoformat()
+    for m in INITIAL_MOVEMENTS:
+        cid = ids.get(m["cliente"])
+        if not cid:
+            continue
+        desc = m["descripcion"] or ""
+        if m.get("origen"):
+            desc = f"{desc} · Origen: {m['origen']}" if desc else f"Origen: {m['origen']}"
+        conn.execute("""
+            INSERT INTO movimientos(
+                fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,
+                estado_conciliacion,creado_en
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            m["fecha"], cid, m["tipo"], desc, m["importe"], m["periodo"],
+            m["comprobante"], None, m["estado"], now
+        ))
+    conn.commit()
+    conn.close()
 
 
 def ensure_emitters():
@@ -316,10 +1600,7 @@ sysgroupmdp@gmail.com
 """
 
 def gmail_configurada():
-    try:
-        return bool(st.secrets.get("gmail_app_password"))
-    except Exception:
-        return False
+    return bool(_secret("gmail_app_password"))
 
 def enviar_factura_por_email(comprobante_id, destinatario=None):
     row = query_df("""
@@ -343,7 +1624,7 @@ def enviar_factura_por_email(comprobante_id, destinatario=None):
         return False, "Falta configurar la credencial privada de Gmail en los secretos de la app."
 
     try:
-        password = st.secrets["gmail_app_password"]
+        password = _secret("gmail_app_password")
         msg = EmailMessage()
         msg["From"] = MAIL_FROM
         msg["To"] = destino
@@ -371,28 +1652,216 @@ def enviar_factura_por_email(comprobante_id, destinatario=None):
                 (comprobante_id, int(r["cliente_id"]), destino, MAIL_SUBJECT, "ERROR", detalle, now))
         return False, f"No se pudo enviar el email: {detalle}"
 
-def registrar_factura_autorizada(comprobante_id, pdf_path):
-    """Se llamará desde el conector ARCA cuando exista CAE y PDF final."""
+def registrar_factura_autorizada(comprobante_id, pdf_path=None):
+    """Registra la deuda de una factura ya autorizada. No vuelve a emitir fiscalmente."""
     row = query_df("SELECT * FROM comprobantes_arca WHERE id=?", (comprobante_id,))
     if len(row) != 1:
         return False, "Comprobante inexistente."
     r = row.iloc[0]
-    execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA', pdf_path=? WHERE id=?", (str(pdf_path), comprobante_id))
+    if pdf_path:
+        execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA', pdf_path=? WHERE id=?", (str(pdf_path), comprobante_id))
+    else:
+        execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA' WHERE id=?", (comprobante_id,))
 
-    comp_ref = f"ARCA-{comprobante_id}"
+    nro = r.get("numero_comprobante")
+    pv = r.get("punto_venta")
+    t = r.get("tipo_comprobante") or ""
+    comp_ref = f"ARCA-{t}-{int(pv or 0):05d}-{int(nro or comprobante_id):08d}"
     try:
         execute("""INSERT INTO movimientos
         (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
         VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (r["fecha_emision"], int(r["cliente_id"]), "Factura/Cargo", "Factura autorizada ARCA", float(r["total"]),
-         r["periodo_desde"] or r["fecha_emision"][:7] + "-01", comp_ref, str(pdf_path), "Pendiente", datetime.now().isoformat()))
+         r["periodo_desde"] or r["fecha_emision"][:7] + "-01", comp_ref, str(pdf_path) if pdf_path else None,
+         "Pendiente", datetime.now().isoformat()))
     except sqlite3.IntegrityError:
         pass
 
+    if not pdf_path:
+        return True, "Factura autorizada y deuda registrada. Falta regenerar el PDF antes de enviarla."
     cliente = query_df("SELECT email_facturacion,envio_automatico_factura FROM clientes WHERE id=?", (int(r["cliente_id"]),))
     if len(cliente) and int(cliente.iloc[0].get("envio_automatico_factura") or 0) == 1:
-        return enviar_factura_por_email(comprobante_id)
+        ok, msg = enviar_factura_por_email(comprobante_id)
+        if not ok:
+            return True, "Factura autorizada y registrada. " + msg
+        return True, msg
     return True, "Factura autorizada y registrada. Envío automático desactivado para este cliente."
+
+
+def arca_credenciales(cuit):
+    d = digits(cuit)
+    cert_b64 = _secret(f"ARCA_{d}_CERT_B64")
+    key_b64 = _secret(f"ARCA_{d}_KEY_B64")
+    if not cert_b64 or not key_b64:
+        return None, None
+    try:
+        return base64.b64decode(cert_b64), base64.b64decode(key_b64)
+    except Exception as e:
+        raise ARCAError(f"Credenciales ARCA mal codificadas para CUIT {cuit}: {e}")
+
+
+def arca_configurada_para(cuit):
+    cert, key = arca_credenciales(cuit)
+    return bool(cert and key)
+
+
+def _fiscal_amounts(emisor, tipo_comprobante, importe_ingresado):
+    regimen = str(emisor.get("regimen_iva") or "").upper()
+    tipo = str(tipo_comprobante).upper()
+    total_ing = round(float(importe_ingresado), 2)
+    if regimen in ("RESPONSABLE_MONOTRIBUTO", "MONOTRIBUTO", "EXENTO"):
+        if tipo != "C":
+            raise ARCAError("Este emisor está configurado para emitir comprobantes C.")
+        return total_ing, total_ing, 0.0, 0.0
+    if regimen == "RESPONSABLE_INSCRIPTO":
+        if tipo not in ("A", "B", "M"):
+            raise ARCAError("Un Responsable Inscripto debe emitir A, B o M según corresponda.")
+        rate = float(emisor.get("iva_alicuota") or 21.0)
+        includes = int(emisor.get("precios_incluyen_iva") if pd.notna(emisor.get("precios_incluyen_iva")) else 1) == 1
+        if includes:
+            net = round(total_ing / (1 + rate/100), 2)
+            iva = round(total_ing - net, 2)
+            total = total_ing
+        else:
+            net = total_ing
+            iva = round(net * rate/100, 2)
+            total = round(net + iva, 2)
+        return total, net, iva, rate
+    raise ARCAError("Falta configurar el régimen de IVA del emisor.")
+
+
+def _validate_production_ready(emisor, cliente, comprobante):
+    faltan = []
+    if not app_password_configurada():
+        faltan.append("contraseña privada de acceso a la app")
+    for field, label in [("domicilio_fiscal","domicilio fiscal del emisor"), ("regimen_iva","régimen IVA del emisor")]:
+        if not str(emisor.get(field) or "").strip():
+            faltan.append(label)
+    if not int(emisor.get("punto_venta") or 0):
+        faltan.append("punto de venta ARCA")
+    if not arca_configurada_para(emisor.get("cuit")):
+        faltan.append("certificado y clave privada ARCA")
+    if len(digits(cliente.get("cuit"))) != 11:
+        faltan.append("CUIT del cliente")
+    if not cliente.get("condicion_iva_receptor_id") or pd.isna(cliente.get("condicion_iva_receptor_id")):
+        faltan.append("condición IVA ARCA del cliente")
+    if not comprobante.get("fecha_vto_pago") or pd.isna(comprobante.get("fecha_vto_pago")):
+        faltan.append("fecha de vencimiento de pago")
+    return faltan
+
+
+def probar_conexion_arca(emisor_id):
+    emis = query_df("SELECT * FROM emisores WHERE id=?", (emisor_id,))
+    if len(emis) != 1:
+        raise ARCAError("Emisor inexistente.")
+    e = emis.iloc[0]
+    cert, key = arca_credenciales(e["cuit"])
+    if not cert or not key:
+        raise ARCAError("Faltan certificado/clave ARCA en Secrets.")
+    ambiente = str(e.get("ambiente_arca") or "HOMOLOGACION").upper()
+    ta = wsaa_login(cert, key, ambiente=ambiente)
+    ptos = wsfe_puntos_venta(ta, e["cuit"], ambiente)
+    return ta, ptos
+
+
+def emitir_comprobante_arca(comprobante_id):
+    row = query_df("""
+        SELECT a.*, c.nombre cliente_nombre,c.cuit cliente_cuit,c.domicilio cliente_domicilio,
+               c.email_facturacion,c.envio_automatico_factura,c.condicion_iva_receptor_id,c.condicion_iva_receptor_desc,
+               e.nombre emisor_nombre,e.cuit emisor_cuit,e.condicion_iva,e.punto_venta,e.domicilio_fiscal,
+               e.ingresos_brutos,e.inicio_actividades,e.regimen_iva,e.iva_alicuota,e.ambiente_arca,e.precios_incluyen_iva
+        FROM comprobantes_arca a
+        JOIN clientes c ON c.id=a.cliente_id
+        JOIN emisores e ON e.id=a.emisor_id
+        WHERE a.id=?
+    """, (comprobante_id,))
+    if len(row) != 1:
+        return False, "No se encontró el comprobante."
+    r = row.iloc[0]
+    if str(r.get("estado_arca") or "").upper() == "AUTORIZADA" and str(r.get("cae") or ""):
+        return True, "La factura ya está autorizada por ARCA. No se volvió a emitir."
+
+    emisor = {
+        "id": r["emisor_id"], "nombre": r["emisor_nombre"], "cuit": r["emisor_cuit"],
+        "condicion_iva": r.get("condicion_iva"), "punto_venta": r.get("punto_venta"),
+        "domicilio_fiscal": r.get("domicilio_fiscal"), "ingresos_brutos": r.get("ingresos_brutos"),
+        "inicio_actividades": r.get("inicio_actividades"), "regimen_iva": r.get("regimen_iva"),
+        "iva_alicuota": r.get("iva_alicuota"), "ambiente_arca": r.get("ambiente_arca"),
+        "precios_incluyen_iva": r.get("precios_incluyen_iva")
+    }
+    cliente = {
+        "id": r["cliente_id"], "nombre": r["cliente_nombre"], "cuit": r["cliente_cuit"],
+        "domicilio": r.get("cliente_domicilio"),
+        "condicion_iva_receptor_id": r.get("condicion_iva_receptor_id"),
+        "condicion_iva_receptor_desc": r.get("condicion_iva_receptor_desc")
+    }
+    faltan = _validate_production_ready(emisor, cliente, r)
+    if faltan:
+        return False, "Falta completar: " + ", ".join(faltan) + "."
+
+    try:
+        cert, key = arca_credenciales(emisor["cuit"])
+        ambiente = str(emisor.get("ambiente_arca") or "HOMOLOGACION").upper()
+        tipo = str(r["tipo_comprobante"]).upper()
+        cbte_tipo = CBTE_CODES[tipo]
+        total, neto, iva, rate = _fiscal_amounts(emisor, tipo, float(r["total"]))
+        ta = wsaa_login(cert, key, ambiente=ambiente)
+        ultimo = wsfe_ultimo_autorizado(ta, emisor["cuit"], int(emisor["punto_venta"]), cbte_tipo, ambiente)
+        siguiente = ultimo + 1
+        f_em = datetime.strptime(str(r["fecha_emision"]), "%Y-%m-%d").strftime("%Y%m%d")
+        f_desde = datetime.strptime(str(r["periodo_desde"]), "%Y-%m-%d").strftime("%Y%m%d") if r.get("periodo_desde") else None
+        f_hasta = datetime.strptime(str(r["periodo_hasta"]), "%Y-%m-%d").strftime("%Y%m%d") if r.get("periodo_hasta") else None
+        f_vto = datetime.strptime(str(r["fecha_vto_pago"]), "%Y-%m-%d").strftime("%Y%m%d")
+        resp = wsfe_solicitar_cae(
+            ta, emisor["cuit"], ambiente,
+            punto_venta=int(emisor["punto_venta"]), cbte_tipo=cbte_tipo, concepto=2,
+            doc_tipo=80, doc_nro=cliente["cuit"], cbte_nro=siguiente, fecha_cbte=f_em,
+            imp_total=total, imp_neto=neto, imp_iva=iva,
+            condicion_iva_receptor_id=int(cliente["condicion_iva_receptor_id"]),
+            fecha_serv_desde=f_desde, fecha_serv_hasta=f_hasta, fecha_vto_pago=f_vto,
+            iva_rate=rate if iva > 0 else None,
+        )
+        obs_txt = "; ".join(f"{o['code']}: {o['msg']}" for o in resp.get("observaciones", []))
+        err_txt = "; ".join(f"{e['code']}: {e['msg']}" for e in resp.get("errors", []))
+        if not resp.get("ok"):
+            execute("UPDATE comprobantes_arca SET estado_arca='RECHAZADA',arca_error=?,arca_observaciones=? WHERE id=?",
+                    (err_txt or f"Resultado ARCA: {resp.get('resultado')}", obs_txt or None, comprobante_id))
+            return False, "ARCA rechazó la factura: " + (err_txt or str(resp.get("resultado")))
+
+        cae = str(resp["cae"])
+        cae_vto_raw = str(resp["cae_vto"])
+        cae_vto = datetime.strptime(cae_vto_raw, "%Y%m%d").strftime("%Y-%m-%d") if len(cae_vto_raw) == 8 else cae_vto_raw
+        execute("""UPDATE comprobantes_arca
+                   SET estado_arca='AUTORIZADA',punto_venta=?,numero_comprobante=?,cae=?,vencimiento_cae=?,
+                       cbte_tipo_codigo=?,imp_neto=?,imp_iva=?,total=?,arca_observaciones=?,arca_error=NULL
+                   WHERE id=?""",
+                (int(emisor["punto_venta"]), int(resp["cbte_nro"]), cae, cae_vto, cbte_tipo, neto, iva, total,
+                 obs_txt or None, comprobante_id))
+
+        # Persistimos CAE antes de generar PDF para nunca perder una autorización fiscal ya obtenida.
+        comp = query_df("SELECT * FROM comprobantes_arca WHERE id=?", (comprobante_id,)).iloc[0].to_dict()
+        comp["doc_tipo"] = 80
+        items_df = query_df("SELECT * FROM comprobante_items WHERE comprobante_id=? ORDER BY id", (comprobante_id,))
+        items = items_df.to_dict("records")
+        safe = f"Factura_{tipo}_{int(emisor['punto_venta']):05d}-{int(resp['cbte_nro']):08d}_{digits(emisor['cuit'])}.pdf"
+        pdf_path = PDF_DIR / safe
+        try:
+            generar_pdf_factura(pdf_path, emisor=emisor, cliente=cliente, comprobante=comp, items=items)
+        except Exception as pdf_e:
+            registrar_factura_autorizada(comprobante_id, None)
+            execute("UPDATE comprobantes_arca SET arca_error=? WHERE id=?",
+                    (f"CAE obtenido correctamente; error generando PDF: {pdf_e}", comprobante_id))
+            return True, f"ARCA autorizó la factura (CAE {cae}), pero hubo un problema generando el PDF: {pdf_e}"
+
+        ok_reg, msg_reg = registrar_factura_autorizada(comprobante_id, pdf_path)
+        prefix = "PRODUCCIÓN" if ambiente == "PRODUCCION" else "HOMOLOGACIÓN"
+        return True, f"{prefix}: factura autorizada. N° {int(emisor['punto_venta']):05d}-{int(resp['cbte_nro']):08d} · CAE {cae}. {msg_reg}"
+    except ARCAError as e:
+        execute("UPDATE comprobantes_arca SET arca_error=? WHERE id=?", (str(e)[:1000], comprobante_id))
+        return False, str(e)
+    except Exception as e:
+        execute("UPDATE comprobantes_arca SET arca_error=? WHERE id=?", (str(e)[:1000], comprobante_id))
+        return False, f"Error inesperado al emitir: {e}"
 
 def extract_pdf_text(uploaded):
     try:
@@ -501,20 +1970,15 @@ def balances_df():
     """)
 
 init_db()
-ensure_demo_data()
+ensure_initial_data()
 ensure_emitters()
 ensure_invoice_items()
 
 st.title("S&S Group · Gestión Administrativa")
 st.caption("Clientes · Facturación · Cuenta corriente · Pagos · Avisos · Trabajos puntuales · ARCA")
 
-# Generación automática silenciosa al abrir.
-# Si SQLite está momentáneamente ocupada, no hacemos caer toda la app.
-try:
-    generate_monthly_notices()
-except sqlite3.OperationalError as e:
-    if "locked" not in str(e).lower():
-        raise
+# Los avisos mensuales no se generan al abrir la app.
+# Se generan desde la pestaña "Avisos de pago" para evitar cargos accidentales.
 
 tabs = st.tabs(["Panel","Emitir factura","Facturas recibidas/PDF","Avisos de pago","Pagos","Trabajos extras","Clientes","Ítems / Leyendas","Cuenta corriente","Exportar","ARCA"])
 
@@ -526,6 +1990,7 @@ with tabs[0]:
     c3.metric("Clientes con deuda", int((saldos["saldo"]>0).sum()))
     movs = query_df("SELECT COUNT(*) n FROM movimientos").iloc[0]["n"]
     c4.metric("Movimientos", int(movs))
+    st.caption("Base migrada del control anterior: 44 clientes · 83 movimientos históricos.")
     st.subheader("Estado por cliente")
     show = saldos.copy()
     show["honorario"] = show["honorario"].map(money)
@@ -568,6 +2033,7 @@ with tabs[1]:
 
         p_desde, p_hasta, p_texto = factura_periodo(fecha_emision, tipo_periodo, manual_desde, manual_hasta)
         st.caption(f"Período seleccionado: **{p_texto}**")
+        fecha_vto_pago = st.date_input("Vencimiento de pago", value=fecha_emision + timedelta(days=10), key="ef_vto_pago")
 
         tipo_comp = st.selectbox("Tipo de comprobante", ["A","B","C","M"], key="ef_tipo_comp")
         catalogo = catalogo_items()
@@ -608,7 +2074,10 @@ with tabs[1]:
         st.metric("Total del borrador", money(total))
         obs = st.text_area("Observaciones", key="ef_obs")
 
-        if st.button("Guardar borrador de factura", type="primary", key="ef_guardar"):
+        b1, b2 = st.columns(2)
+        guardar = b1.button("Guardar borrador", key="ef_guardar")
+        emitir = b2.button("Emitir ahora en ARCA", type="primary", key="ef_emitir_arca")
+        if guardar or emitir:
             if not items:
                 st.error("Agregá al menos un ítem.")
             elif total <= 0:
@@ -620,7 +2089,12 @@ with tabs[1]:
                     cid, emisor_id, fecha_emision, p_desde, p_hasta, p_texto,
                     tipo_periodo, tipo_comp, items, obs
                 )
-                st.success(f"Borrador #{fid} guardado por {money(total_guardado)} a nombre de {emisor_sel}.")
+                execute("UPDATE comprobantes_arca SET fecha_vto_pago=? WHERE id=?", (fecha_vto_pago.isoformat(), fid))
+                if guardar:
+                    st.success(f"Borrador #{fid} guardado por {money(total_guardado)} a nombre de {emisor_sel}.")
+                else:
+                    ok, msg = emitir_comprobante_arca(fid)
+                    (st.success if ok else st.error)(msg)
 
 with tabs[2]:
     st.subheader("Carga masiva de facturas PDF existentes")
@@ -760,11 +2234,15 @@ with tabs[6]:
             mod=st.selectbox("Modalidad",["Factura","Aviso de pago"])
             hon=st.number_input("Honorario vigente",min_value=0.0,step=1000.0)
             vd=st.date_input("Vigente desde",value=date.today().replace(day=1))
+            domicilio=st.text_input("Domicilio fiscal / comercial")
+            cond_id=st.number_input("ID condición IVA receptor (ARCA)", min_value=0, step=1, value=0, help="Se puede consultar en la pestaña ARCA una vez conectado el emisor.")
+            cond_desc=st.text_input("Condición frente al IVA", placeholder="Ej.: Responsable Inscripto")
             email_fact=st.text_input("Email de facturación")
             envio_auto=st.checkbox("Enviar factura automáticamente por email", value=True)
             if st.form_submit_button("Crear cliente"):
-                execute("""INSERT INTO clientes(nombre,cuit,modalidad,honorario,vigente_desde,dia_generacion,activo,email_facturacion,envio_automatico_factura)
-                VALUES(?,?,?,?,?,?,1,?,?)""",(n,cuit or None,mod,hon,vd.isoformat(),1,email_fact.strip() or None,1 if envio_auto else 0))
+                execute("""INSERT INTO clientes(nombre,cuit,modalidad,honorario,vigente_desde,dia_generacion,activo,email_facturacion,envio_automatico_factura,domicilio,condicion_iva_receptor_id,condicion_iva_receptor_desc)
+                VALUES(?,?,?,?,?,?,1,?,?,?,?,?)""",(n,cuit or None,mod,hon,vd.isoformat(),1,email_fact.strip() or None,1 if envio_auto else 0,
+                domicilio.strip() or None, int(cond_id) if cond_id else None, cond_desc.strip() or None))
                 st.success("Cliente creado.")
     with c2:
         st.markdown("#### Cambiar honorario")
@@ -794,6 +2272,25 @@ with tabs[6]:
             cid = int(clientes_asig.loc[clientes_asig["nombre"] == ca, "id"].iloc[0])
             execute("UPDATE clientes SET emisor_predeterminado_id=? WHERE id=?", (em_map[ea], cid))
             st.success("Emisor habitual actualizado.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Datos fiscales del cliente")
+    clientes_fisc = get_clientes(True)
+    if len(clientes_fisc):
+        cf = st.selectbox("Cliente para datos fiscales", clientes_fisc["nombre"].tolist(), key="fisc_cliente_cfg")
+        cfr = clientes_fisc[clientes_fisc["nombre"] == cf].iloc[0]
+        f1, f2 = st.columns(2)
+        fcuit = f1.text_input("CUIT del cliente", value=str(cfr.get("cuit") or ""), key="fisc_cuit")
+        fdom = f2.text_input("Domicilio", value=str(cfr.get("domicilio") or ""), key="fisc_dom")
+        f3, f4 = st.columns(2)
+        current_cond = int(cfr.get("condicion_iva_receptor_id")) if pd.notna(cfr.get("condicion_iva_receptor_id")) else 0
+        fidiva = f3.number_input("ID condición IVA receptor (ARCA)", min_value=0, value=current_cond, step=1, key="fisc_idiva")
+        fdesc = f4.text_input("Descripción condición IVA", value=str(cfr.get("condicion_iva_receptor_desc") or ""), key="fisc_desciva")
+        if st.button("Guardar datos fiscales del cliente", key="fisc_save"):
+            execute("UPDATE clientes SET cuit=?,domicilio=?,condicion_iva_receptor_id=?,condicion_iva_receptor_desc=? WHERE id=?",
+                    (fcuit.strip() or None, fdom.strip() or None, int(fidiva) if fidiva else None, fdesc.strip() or None, int(cfr["id"])))
+            st.success("Datos fiscales guardados.")
             st.rerun()
 
     st.divider()
@@ -883,63 +2380,143 @@ with tabs[9]:
 
 
 with tabs[10]:
-    st.subheader("ARCA")
-    st.warning("MODO ACTUAL: BORRADOR / SIN EMISIÓN REAL")
-    st.write("El sistema ya está preparado para trabajar con tres CUIT emisores distintos.")
+    st.subheader("ARCA · Facturación electrónica real")
+    st.caption("Conector WSAA + WSFEv1. La app sólo emite si la configuración fiscal y las credenciales del CUIT están completas.")
+
+    if not app_password_configurada():
+        st.error("Antes de habilitar PRODUCCIÓN configurá `app_password` en Secrets. Esta app está publicada en Internet y no es seguro emitir sin acceso privado.")
+    else:
+        st.success("Acceso privado de la app configurado.")
 
     emis = get_emisores(False)
     if len(emis):
-        st.markdown("#### Emisores configurados")
-        st.dataframe(
-            emis[["id","nombre","cuit","condicion_iva","punto_venta","activo"]],
-            use_container_width=True,
-            hide_index=True
-        )
+        st.markdown("#### Emisores")
+        show_cols = [c for c in ["id","nombre","cuit","regimen_iva","punto_venta","ambiente_arca","activo"] if c in emis.columns]
+        st.dataframe(emis[show_cols], use_container_width=True, hide_index=True)
 
-        st.markdown("#### Configuración fiscal básica")
         em_labels = {emisor_label(r): int(r["id"]) for _, r in emis.iterrows()}
         ec = st.selectbox("Emisor a configurar", list(em_labels.keys()), key="arca_cfg_emisor")
         current = emis[emis["id"] == em_labels[ec]].iloc[0]
-        cc1, cc2 = st.columns(2)
-        cond = cc1.text_input("Condición frente al IVA", value=str(current["condicion_iva"] or ""), key="arca_cond")
-        pv = cc2.number_input("Punto de venta", min_value=1, value=int(current["punto_venta"] or 1), step=1, key="arca_pv")
-        if st.button("Guardar configuración fiscal", key="arca_guardar_cfg"):
-            execute(
-                "UPDATE emisores SET condicion_iva=?, punto_venta=? WHERE id=?",
-                (cond.strip(), int(pv), em_labels[ec])
-            )
+
+        st.markdown("##### Datos fiscales")
+        a1, a2, a3 = st.columns(3)
+        regimen_opts = ["", "RESPONSABLE_MONOTRIBUTO", "RESPONSABLE_INSCRIPTO", "EXENTO"]
+        current_reg = str(current.get("regimen_iva") or "")
+        reg_idx = regimen_opts.index(current_reg) if current_reg in regimen_opts else 0
+        regimen = a1.selectbox("Régimen frente al IVA", regimen_opts, index=reg_idx, key="arca_regimen")
+        pv = a2.number_input("Punto de venta WSFE", min_value=1, value=int(current.get("punto_venta") or 1), step=1, key="arca_pv")
+        amb_opts = ["HOMOLOGACION", "PRODUCCION"]
+        amb_current = str(current.get("ambiente_arca") or "HOMOLOGACION").upper()
+        ambiente = a3.selectbox("Ambiente", amb_opts, index=amb_opts.index(amb_current) if amb_current in amb_opts else 0, key="arca_amb")
+
+        a4, a5 = st.columns(2)
+        domicilio_fiscal = a4.text_input("Domicilio fiscal", value=str(current.get("domicilio_fiscal") or ""), key="arca_dom")
+        iibb = a5.text_input("Ingresos Brutos", value=str(current.get("ingresos_brutos") or ""), key="arca_iibb")
+        a6, a7, a8 = st.columns(3)
+        ini_txt = str(current.get("inicio_actividades") or "")
+        try:
+            ini_default = datetime.strptime(ini_txt, "%Y-%m-%d").date() if ini_txt else date.today()
+        except Exception:
+            ini_default = date.today()
+        inicio_act = a6.date_input("Inicio de actividades", value=ini_default, key="arca_ini")
+        iva_rate = a7.selectbox("Alícuota IVA habitual", [21.0, 10.5, 27.0, 5.0, 2.5, 0.0], index=0, key="arca_iva_rate")
+        incl_actual = bool(int(current.get("precios_incluyen_iva") if pd.notna(current.get("precios_incluyen_iva")) else 1))
+        incluye_iva = a8.checkbox("Importes cargados incluyen IVA", value=incl_actual, key="arca_inc_iva")
+        cond_text = st.text_input("Texto condición frente al IVA para el PDF", value=str(current.get("condicion_iva") or ""), key="arca_cond_text")
+
+        if st.button("Guardar configuración fiscal del emisor", key="arca_guardar_cfg"):
+            execute("""UPDATE emisores SET condicion_iva=?,punto_venta=?,domicilio_fiscal=?,ingresos_brutos=?,inicio_actividades=?,
+                       regimen_iva=?,iva_alicuota=?,ambiente_arca=?,precios_incluyen_iva=? WHERE id=?""",
+                    (cond_text.strip() or None, int(pv), domicilio_fiscal.strip() or None, iibb.strip() or None,
+                     inicio_act.isoformat(), regimen or None, float(iva_rate), ambiente, 1 if incluye_iva else 0, em_labels[ec]))
             st.success("Configuración fiscal guardada.")
             st.rerun()
 
-    st.markdown("#### Borradores / comprobantes")
+        cuit_current = str(current["cuit"])
+        st.markdown("##### Certificado ARCA")
+        if arca_configurada_para(cuit_current):
+            st.success(f"Certificado y clave privada cargados en Secrets para {cuit_current}.")
+        else:
+            st.warning(f"Todavía no hay certificado/clave privada cargados para {cuit_current}.")
+            if st.button("Generar clave privada + CSR para este CUIT", key="arca_gen_csr"):
+                try:
+                    key_bytes, csr_bytes = generar_clave_y_csr(cuit_current, str(current["nombre"]), "gestion-sysgroup")
+                    st.session_state["generated_arca_key"] = key_bytes
+                    st.session_state["generated_arca_csr"] = csr_bytes
+                except Exception as e:
+                    st.error(str(e))
+            if st.session_state.get("generated_arca_key") and st.session_state.get("generated_arca_csr"):
+                st.warning("Guardá la clave privada en un lugar seguro. No la subas a GitHub ni la compartas.")
+                d1, d2 = st.columns(2)
+                d1.download_button("Descargar clave privada", st.session_state["generated_arca_key"], file_name=f"ARCA_{digits(cuit_current)}.key", mime="application/octet-stream")
+                d2.download_button("Descargar CSR", st.session_state["generated_arca_csr"], file_name=f"ARCA_{digits(cuit_current)}.csr", mime="application/pkcs10")
+
+        if st.button("Probar conexión con ARCA (sin emitir)", key="arca_test_conn"):
+            try:
+                ta, ptos = probar_conexion_arca(em_labels[ec])
+                st.success(f"Conexión correcta. Ticket WSAA obtenido; vence {ta.expiration_time}.")
+                if ptos:
+                    st.dataframe(pd.DataFrame(ptos), use_container_width=True, hide_index=True)
+                else:
+                    st.info("ARCA no devolvió puntos de venta para este certificado/CUIT.")
+            except Exception as e:
+                st.error(str(e))
+
+        if arca_configurada_para(cuit_current):
+            if st.button("Consultar condiciones IVA receptor permitidas", key="arca_cond_iva_btn"):
+                try:
+                    cert, key = arca_credenciales(cuit_current)
+                    ta = wsaa_login(cert, key, ambiente=str(current.get("ambiente_arca") or "HOMOLOGACION"))
+                    data = wsfe_condiciones_iva_receptor(ta, cuit_current, str(current.get("ambiente_arca") or "HOMOLOGACION"))
+                    if data:
+                        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No se recibieron condiciones; revisá el ambiente y la autorización del servicio.")
+                except Exception as e:
+                    st.error(str(e))
+
+    st.divider()
+    st.markdown("#### Facturas preparadas / emitidas")
     comps = query_df("""
         SELECT a.id,a.fecha_emision,c.nombre cliente,
-               COALESCE(e.nombre,'Sin asignar') emisor,
-               COALESCE(e.cuit,'') cuit_emisor,
-               a.periodo_texto,a.tipo_comprobante,a.total,a.estado_arca,a.cae,
-               a.pdf_path,a.email_enviado,a.email_enviado_a,a.email_enviado_en,a.email_error
+               COALESCE(e.nombre,'Sin asignar') emisor,COALESCE(e.cuit,'') cuit_emisor,
+               a.periodo_texto,a.tipo_comprobante,a.punto_venta,a.numero_comprobante,a.total,a.estado_arca,a.cae,
+               a.pdf_path,a.email_enviado,a.email_enviado_a,a.email_enviado_en,a.arca_error,a.arca_observaciones
         FROM comprobantes_arca a
         JOIN clientes c ON c.id=a.cliente_id
         LEFT JOIN emisores e ON e.id=a.emisor_id
         ORDER BY a.id DESC
     """)
     if len(comps):
-        filtro = st.selectbox("Filtrar por emisor", ["Todos"] + sorted(comps["emisor"].dropna().unique().tolist()))
+        filtro = st.selectbox("Filtrar por emisor", ["Todos"] + sorted(comps["emisor"].dropna().unique().tolist()), key="arca_filter")
         vista = comps.copy()
         if filtro != "Todos":
             vista = vista[vista["emisor"] == filtro]
-        vista["total"] = vista["total"].map(money)
-        st.dataframe(vista, use_container_width=True, hide_index=True)
-    else:
-        st.info("Todavía no hay borradores de facturación.")
+        vista_display = vista.copy()
+        vista_display["total"] = vista_display["total"].map(money)
+        st.dataframe(vista_display, use_container_width=True, hide_index=True)
 
+        drafts = comps[comps["estado_arca"].fillna("BORRADOR").isin(["BORRADOR","RECHAZADA"])]
+        if len(drafts):
+            did = st.selectbox("Borrador a emitir", drafts["id"].tolist(), key="arca_draft_sel")
+            dr = drafts[drafts["id"] == did].iloc[0]
+            st.caption(f"{dr['cliente']} · {dr['emisor']} · {dr['tipo_comprobante']} · {money(dr['total'])}")
+            if st.button("EMITIR EN ARCA", type="primary", key="arca_emit_existing"):
+                ok, msg = emitir_comprobante_arca(int(did))
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+    else:
+        st.info("Todavía no hay facturas preparadas.")
+
+    st.divider()
     st.markdown("#### Correo automático")
-    st.write(f"**Remitente:** {MAIL_FROM}  ·  **Asunto:** {MAIL_SUBJECT}")
+    st.write(f"**Remitente:** {MAIL_FROM} · **Asunto:** {MAIL_SUBJECT}")
     st.text_area("Cuerpo predeterminado", value=MAIL_BODY, height=220, disabled=True, key="mail_body_preview")
     if gmail_configurada():
         st.success("Credencial privada de Gmail configurada.")
     else:
-        st.info("La app está lista para enviar, pero falta cargar la credencial privada de Gmail al publicarla.")
+        st.warning("Falta configurar la credencial privada de Gmail. La factura puede emitirse en ARCA, pero no se enviará automáticamente hasta hacerlo.")
 
     autorizadas = query_df("""
         SELECT a.id,c.nombre cliente,c.email_facturacion,a.pdf_path,a.email_enviado,a.email_enviado_a,a.email_enviado_en
@@ -962,14 +2539,5 @@ with tabs[10]:
             (st.success if ok else st.error)(msg)
 
     st.divider()
-    st.markdown("""
-    **Próxima etapa de integración ARCA**
-    - Certificado digital y clave privada separados por CUIT.
-    - Punto de venta configurable por emisor.
-    - Autenticación WSAA independiente.
-    - Consulta del último comprobante por CUIT / punto de venta / tipo.
-    - Solicitud de CAE.
-    - Registro automático en la cuenta corriente del cliente.
-    - PDF final del comprobante.
-    """)
+    st.info("Secuencia fiscal implementada: WSAA → último comprobante → FECAESolicitar → CAE → PDF con QR → cuenta corriente → email. Para PRODUCCIÓN se requiere completar la habilitación/certificados de cada CUIT en ARCA.")
 
