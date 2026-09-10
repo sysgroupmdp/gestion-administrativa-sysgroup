@@ -1340,10 +1340,10 @@ INITIAL_MOVEMENTS = [{'fecha': '2026-09-01',
   'estado': None,
   'seq': 73}]
 
-SEED_VERSION = "2026-09-09-ultimo-excel-14217700"
+SEED_VERSION = "2026-09-10-restaurar-base-14217700-v2"
 
 def ensure_initial_data():
-    """Sincroniza una sola vez la base con el último Excel entregado por Martín."""
+    """Restaura una sola vez la base administrativa de Control de cuentas(1).xlsx (saldo fuente $ 14.217.700)."""
     conn = get_conn()
     conn.execute("CREATE TABLE IF NOT EXISTS app_meta(clave TEXT PRIMARY KEY, valor TEXT)")
     row = conn.execute("SELECT valor FROM app_meta WHERE clave='seed_version'").fetchone()
