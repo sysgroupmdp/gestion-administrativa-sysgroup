@@ -15,7 +15,7 @@ from pypdf import PdfReader
 from arca_ws import (ARCAError, CBTE_CODES, digits, generar_clave_y_csr, wsaa_login,
                      wsfe_ultimo_autorizado, wsfe_puntos_venta, wsfe_condiciones_iva_receptor,
                      wsfe_solicitar_cae)
-from fiscal_pdf_v3 import generar_pdf_factura, PDF_TEMPLATE_VERSION
+from fiscal_pdf import generar_pdf_factura
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "control_cuentas.db"
@@ -1702,73 +1702,6 @@ def probar_conexion_arca(emisor_id):
     return ta, ptos
 
 
-
-def _safe_filename_piece(txt):
-    txt = str(txt or "").strip()
-    txt = re.sub(r'[\\/:*?"<>|]+', ' ', txt)
-    txt = re.sub(r'\s+', ' ', txt).strip()
-    return txt or "CLIENTE"
-
-
-def _nombre_pdf_factura(comp, cliente_nombre):
-    cliente_archivo = _safe_filename_piece(cliente_nombre)
-    tipo_periodo_guardado = str(comp.get("tipo_periodo") or "")
-    if tipo_periodo_guardado in ("Mes vigente", "Mes vencido"):
-        periodo_archivo = str(comp.get("periodo_texto") or "").replace("/", "-").strip()
-        if not periodo_archivo:
-            periodo_archivo = str(comp.get("fecha_emision") or "")[:7].replace("-", "-")
-        return f"{cliente_archivo} - {periodo_archivo}.pdf"
-    try:
-        fecha_archivo = datetime.strptime(str(comp.get("fecha_emision")), "%Y-%m-%d").strftime("%d-%m-%Y")
-    except Exception:
-        fecha_archivo = str(comp.get("fecha_emision") or "FECHA").replace("/", "-")
-    return f"{cliente_archivo} - {fecha_archivo}.pdf"
-
-
-def regenerar_pdf_autorizada(comprobante_id):
-    row = query_df("""
-        SELECT a.*, c.nombre cliente_nombre,c.cuit cliente_cuit,c.domicilio cliente_domicilio,
-               c.condicion_iva_receptor_id,c.condicion_iva_receptor_desc,
-               e.nombre emisor_nombre,e.cuit emisor_cuit,e.condicion_iva,e.punto_venta AS emisor_punto_venta,
-               e.domicilio_fiscal,e.ingresos_brutos,e.inicio_actividades,e.regimen_iva,e.iva_alicuota,
-               e.ambiente_arca,e.precios_incluyen_iva
-        FROM comprobantes_arca a
-        JOIN clientes c ON c.id=a.cliente_id
-        JOIN emisores e ON e.id=a.emisor_id
-        WHERE a.id=?
-    """, (comprobante_id,))
-    if len(row) != 1:
-        return False, "No se encontró el comprobante."
-    r = row.iloc[0].to_dict()
-    if str(r.get("estado_arca") or "").upper() != "AUTORIZADA" or not str(r.get("cae") or ""):
-        return False, "La factura todavía no está autorizada por ARCA."
-
-    emisor = {
-        "id": r.get("emisor_id"), "nombre": r.get("emisor_nombre"), "cuit": r.get("emisor_cuit"),
-        "condicion_iva": r.get("condicion_iva"), "punto_venta": r.get("punto_venta") or r.get("emisor_punto_venta"),
-        "domicilio_fiscal": r.get("domicilio_fiscal"), "ingresos_brutos": r.get("ingresos_brutos"),
-        "inicio_actividades": r.get("inicio_actividades"), "regimen_iva": r.get("regimen_iva"),
-        "iva_alicuota": r.get("iva_alicuota"), "ambiente_arca": r.get("ambiente_arca"),
-        "precios_incluyen_iva": r.get("precios_incluyen_iva")
-    }
-    cliente = {
-        "id": r.get("cliente_id"), "nombre": r.get("cliente_nombre"), "cuit": r.get("cliente_cuit"),
-        "domicilio": r.get("cliente_domicilio"),
-        "condicion_iva_receptor_id": r.get("condicion_iva_receptor_id"),
-        "condicion_iva_receptor_desc": r.get("condicion_iva_receptor_desc")
-    }
-    total = float(r.get("total") or 0)
-    r["doc_tipo"] = _doc_receptor(cliente, total)[0] or 99
-    items_df = query_df("SELECT * FROM comprobante_items WHERE comprobante_id=? ORDER BY id", (comprobante_id,))
-    items = items_df.to_dict("records")
-    pdf_path = PDF_DIR / _nombre_pdf_factura(r, r.get("cliente_nombre"))
-    generar_pdf_factura(pdf_path, emisor=emisor, cliente=cliente, comprobante=r, items=items)
-    execute("UPDATE comprobantes_arca SET pdf_path=?, arca_error=NULL WHERE id=?", (str(pdf_path), comprobante_id))
-    execute("UPDATE movimientos SET pdf_path=? WHERE comprobante LIKE ? AND cliente_id=?",
-            (str(pdf_path), f"ARCA-%-{int(r.get('punto_venta') or 0):05d}-{int(r.get('numero_comprobante') or 0):08d}", int(r.get('cliente_id'))))
-    return True, f"PDF regenerado con plantilla {PDF_TEMPLATE_VERSION}."
-
-
 def emitir_comprobante_arca(comprobante_id):
     row = query_df("""
         SELECT a.*, c.nombre cliente_nombre,c.cuit cliente_cuit,c.domicilio cliente_domicilio,
@@ -1848,7 +1781,7 @@ def emitir_comprobante_arca(comprobante_id):
         comp["doc_tipo"] = _doc_receptor(cliente, total)[0]
         items_df = query_df("SELECT * FROM comprobante_items WHERE comprobante_id=? ORDER BY id", (comprobante_id,))
         items = items_df.to_dict("records")
-        safe = _nombre_pdf_factura(comp, cliente.get("nombre"))
+        safe = f"Factura_{tipo}_{int(emisor['punto_venta']):05d}-{int(resp['cbte_nro']):08d}_{digits(emisor['cuit'])}.pdf"
         pdf_path = PDF_DIR / safe
         try:
             generar_pdf_factura(pdf_path, emisor=emisor, cliente=cliente, comprobante=comp, items=items)
@@ -1897,37 +1830,68 @@ def parse_arg_money(s):
         return None
 
 def parse_invoice(text):
-    out = {"cuit":None, "fecha":None, "comprobante":None, "importe":None}
+    """Intenta leer facturas PDF, incluidas las descargadas desde ARCA."""
+    out = {"cuit": None, "fecha": None, "comprobante": None, "importe": None}
     if not text:
         return out
 
-    cuit = re.search(r"CUIT[:\s]*(\d{2}-?\d{8}-?\d)", text, re.I)
-    if cuit:
-        out["cuit"] = re.sub(r"\D","",cuit.group(1))
+    clean = re.sub(r"[\u00a0\t]+", " ", text)
 
-    fecha = re.search(r"(?:Fecha(?: de Emisi[oó]n)?|Emisi[oó]n)[:\s]*(\d{1,2}/\d{1,2}/\d{4})", text, re.I)
-    if fecha:
-        try:
-            out["fecha"] = datetime.strptime(fecha.group(1), "%d/%m/%Y").date()
-        except:
-            pass
+    # CUIT receptor: en PDFs ARCA puede aparecer como CUIT, CUIT Nro. o CUIT:.
+    cuit_patterns = [
+        r"CUIT(?:\s+Nro\.?|\s+N[°ºo]\.?)?[:\s]*(\d{2}[-\s]?\d{8}[-\s]?\d)",
+        r"Doc\.?\s*(?:Nro\.?|N[°ºo]\.?)?[:\s]*(\d{11})",
+    ]
+    cuits = []
+    for pat in cuit_patterns:
+        cuits += re.findall(pat, clean, re.I)
+    if cuits:
+        # El último CUIT suele corresponder al receptor en la factura ARCA.
+        out["cuit"] = re.sub(r"\D", "", cuits[-1])
 
-    comp = re.search(r"(?:Comp\.?|Comprobante|Factura)\s*(?:N[°ºo]\.?\s*)?([A-Z]?\s*\d{3,5}-\d{6,8})", text, re.I)
-    if comp:
-        out["comprobante"] = re.sub(r"\s+"," ",comp.group(1)).strip()
+    fecha_patterns = [
+        r"Fecha(?:\s+de)?\s+Emisi[oó]n[:\s]*(\d{1,2}/\d{1,2}/\d{4})",
+        r"Fecha[:\s]*(\d{1,2}/\d{1,2}/\d{4})",
+        r"Emisi[oó]n[:\s]*(\d{1,2}/\d{1,2}/\d{4})",
+    ]
+    for pat in fecha_patterns:
+        m = re.search(pat, clean, re.I)
+        if m:
+            try:
+                out["fecha"] = datetime.strptime(m.group(1), "%d/%m/%Y").date()
+                break
+            except Exception:
+                pass
 
-    pats = [
-        r"Importe Total[:\s$]*([\d\.\,]+)",
+    comp_patterns = [
+        r"Comp\.?\s*Nro\.?[:\s]*(\d{4,5}-\d{6,8})",
+        r"Comprobante(?:\s+Nro\.?|\s+N[°ºo]\.?)?[:\s]*(\d{4,5}-\d{6,8})",
+        r"Factura\s+[ABC]?(?:\s+N[°ºo]\.?)?[:\s]*(\d{4,5}-\d{6,8})",
+        r"Punto de Venta[:\s]*(\d{1,5}).{0,80}?(?:Comp\.?\s*Nro\.?|N[°ºo]\.? de Comp\.?)[^\d]*(\d{1,8})",
+    ]
+    for pat in comp_patterns:
+        m = re.search(pat, clean, re.I | re.S)
+        if m:
+            if len(m.groups()) == 2:
+                out["comprobante"] = f"{int(m.group(1)):05d}-{int(m.group(2)):08d}"
+            else:
+                out["comprobante"] = re.sub(r"\s+", " ", m.group(1)).strip()
+            break
+
+    total_patterns = [
+        r"Importe\s+Total[:\s$]*([\d\.\,]+)",
+        r"Total\s+Comprobante[:\s$]*([\d\.\,]+)",
+        r"TOTAL[:\s$]*([\d\.\,]+)",
         r"Total[:\s$]*([\d\.\,]+)",
-        r"TOTAL[:\s$]*([\d\.\,]+)"
     ]
     vals = []
-    for pat in pats:
-        for m in re.findall(pat,text,re.I):
+    for pat in total_patterns:
+        for m in re.findall(pat, clean, re.I):
             v = parse_arg_money(m)
             if v and v > 0:
                 vals.append(v)
     if vals:
+        # En facturas ARCA pueden aparecer subtotales; el importe total suele ser el mayor valor.
         out["importe"] = max(vals)
     return out
 
@@ -1944,24 +1908,42 @@ def resolve_cliente(parsed, filename):
             return int(r["id"]), r["nombre"]
     return None, None
 
-def generate_monthly_notices(period=None):
+def generate_monthly_notices(period=None, cliente_id=None, importe_override=None):
+    """Genera avisos del mes. Si cliente_id está informado, genera sólo ese cliente."""
     if period is None:
         period = date.today().replace(day=1)
+    period = period.replace(day=1)
     periodo = period.isoformat()
-    clientes = query_df("SELECT * FROM clientes WHERE activo=1 AND modalidad='Aviso de pago'")
-    generated=0
-    for _,r in clientes.iterrows():
-        fecha = period.replace(day=min(int(r["dia_generacion"] or 1),28)).isoformat()
+
+    if cliente_id is None:
+        clientes = query_df("SELECT * FROM clientes WHERE activo=1 AND modalidad='Aviso de pago' ORDER BY nombre")
+    else:
+        clientes = query_df(
+            "SELECT * FROM clientes WHERE id=? AND activo=1 AND modalidad='Aviso de pago'",
+            (int(cliente_id),)
+        )
+
+    generated = 0
+    duplicates = 0
+    for _, r in clientes.iterrows():
+        fecha = period.replace(day=min(int(r["dia_generacion"] or 1), 28)).isoformat()
+        importe = float(importe_override) if (cliente_id is not None and importe_override is not None) else float(r["honorario"] or 0)
+        comprobante = f"AVISO-{period.strftime('%Y%m')}"
         try:
             execute("""INSERT INTO movimientos
             (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
             VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (fecha,int(r["id"]),"Aviso de pago",f"Honorarios {period.strftime('%m/%Y')}",
-             float(r["honorario"] or 0),periodo,f"AVISO-{period.strftime('%Y%m')}",None,None,datetime.now().isoformat()))
-            generated+=1
+            (fecha, int(r["id"]), "Aviso de pago", f"Honorarios {period.strftime('%m/%Y')}",
+             importe, periodo, comprobante, None, None, datetime.now().isoformat()))
+            generated += 1
         except sqlite3.IntegrityError:
-            pass
-    return generated
+            duplicates += 1
+    return generated, duplicates
+
+
+def delete_notice(movimiento_id):
+    """Elimina únicamente un movimiento del tipo Aviso de pago."""
+    execute("DELETE FROM movimientos WHERE id=? AND tipo='Aviso de pago'", (int(movimiento_id),))
 
 def balances_df():
     return query_df("""
@@ -2050,7 +2032,6 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Emitir factura C")
     st.caption("Los tres emisores son monotributistas. El sistema sólo emite Factura C.")
-    st.caption(f"Plantilla PDF activa: {PDF_TEMPLATE_VERSION} · ORIGINAL + DUPLICADO + TRIPLICADO")
 
     emisores = get_emisores(True)
     if len(emisores) == 0:
@@ -2175,83 +2156,149 @@ with tabs[1]:
                     st.error(str(e))
 
 with tabs[2]:
-    st.subheader("Carga masiva de facturas PDF existentes")
-    st.write("Para facturas ya emitidas por fuera del sistema: subilas juntas y se incorporan a la cuenta corriente.")
-    files = st.file_uploader("Facturas PDF", type=["pdf"], accept_multiple_files=True)
-    if files:
-        parsed_rows=[]
-        file_map={}
-        for f in files:
-            raw=f.getvalue()
-            file_map[f.name]=raw
-            text=extract_pdf_text(io.BytesIO(raw))
-            parsed=parse_invoice(text)
-            cid,cname=resolve_cliente(parsed,f.name)
-            parsed_rows.append({
-                "archivo":f.name,
-                "cliente_id":cid,
-                "cliente":cname or "",
-                "fecha":parsed["fecha"] or date.today(),
-                "comprobante":parsed["comprobante"] or "",
-                "importe":parsed["importe"] or 0.0,
-                "estado":"OK" if cid and parsed["importe"] else "REVISAR"
-            })
-        df=pd.DataFrame(parsed_rows)
-        st.dataframe(df[["archivo","cliente","fecha","comprobante","importe","estado"]], use_container_width=True, hide_index=True)
+    st.subheader("Facturas existentes / ARCA")
+    st.write("Podés incorporar facturas emitidas por este sistema, descargadas de ARCA o emitidas anteriormente por otro medio.")
 
-        clientes = get_clientes(True)
-        st.caption("Si algún PDF no fue reconocido, podés cargarlo individualmente abajo.")
-        if st.button("Confirmar lote reconocido", type="primary"):
-            ok=0; errs=[]
+    st.markdown("#### Carga masiva con lectura automática")
+    archivos_pdf = st.file_uploader("Facturas PDF", type=["pdf"], accept_multiple_files=True, key="facturas_masivas")
+    if archivos_pdf:
+        parsed_rows = []
+        file_map = {}
+        for f in archivos_pdf:
+            raw = f.getvalue()
+            file_map[f.name] = raw
+            text = extract_pdf_text(io.BytesIO(raw))
+            parsed = parse_invoice(text)
+            cid, cname = resolve_cliente(parsed, f.name)
+            parsed_rows.append({
+                "archivo": f.name,
+                "cliente_id": cid,
+                "cliente": cname or "",
+                "fecha": parsed["fecha"] or date.today(),
+                "comprobante": parsed["comprobante"] or "",
+                "importe": parsed["importe"] or 0.0,
+                "estado": "OK" if cid and parsed["importe"] else "REVISAR / CARGAR MANUAL"
+            })
+        df = pd.DataFrame(parsed_rows)
+        st.dataframe(df[["archivo", "cliente", "fecha", "comprobante", "importe", "estado"]], use_container_width=True, hide_index=True)
+        st.caption("Se guardan automáticamente sólo las filas reconocidas. Las que digan REVISAR podés cargarlas en el formulario manual de abajo sin perder el PDF.")
+
+        if st.button("Confirmar facturas reconocidas", type="primary", key="confirmar_lote_facturas"):
+            ok = 0
+            errs = []
             for row in parsed_rows:
                 if not row["cliente_id"] or not row["importe"]:
                     continue
-                safe_name = datetime.now().strftime("%Y%m%d%H%M%S_") + re.sub(r"[^A-Za-z0-9_.-]","_",row["archivo"])
-                p=PDF_DIR/safe_name
+                safe_name = datetime.now().strftime("%Y%m%d%H%M%S_%f_") + re.sub(r"[^A-Za-z0-9_.-]", "_", row["archivo"])
+                p = PDF_DIR / safe_name
                 p.write_bytes(file_map[row["archivo"]])
-                periodo=date(row["fecha"].year,row["fecha"].month,1).isoformat()
+                periodo_fact = date(row["fecha"].year, row["fecha"].month, 1).isoformat()
                 try:
                     execute("""INSERT INTO movimientos
                     (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
                     VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (row["fecha"].isoformat(),row["cliente_id"],"Factura/Cargo","Factura",float(row["importe"]),
-                     periodo,row["comprobante"] or row["archivo"],str(p),None,datetime.now().isoformat()))
-                    ok+=1
+                    (row["fecha"].isoformat(), row["cliente_id"], "Factura/Cargo", "Factura externa / ARCA",
+                     float(row["importe"]), periodo_fact, row["comprobante"] or row["archivo"], str(p),
+                     "Importada", datetime.now().isoformat()))
+                    ok += 1
                 except sqlite3.IntegrityError:
                     errs.append(row["archivo"])
             st.success(f"Facturas cargadas: {ok}")
             if errs:
-                st.warning("Posibles duplicadas: " + ", ".join(errs))
+                st.warning("No se cargaron porque parecen duplicadas: " + ", ".join(errs))
 
     st.divider()
-    st.subheader("Carga manual de una factura")
-    clientes=get_clientes(True)
-    with st.form("factura_manual"):
-        nom=st.selectbox("Cliente", clientes["nombre"].tolist(), key="fm_cli")
-        fecha=st.date_input("Fecha", value=date.today(), key="fm_fecha")
-        comp=st.text_input("Comprobante", key="fm_comp")
-        importe=st.number_input("Importe", min_value=0.0, step=1000.0, key="fm_imp")
-        archivo=st.file_uploader("PDF opcional", type=["pdf"], key="fm_pdf")
-        submitted=st.form_submit_button("Guardar factura")
+    st.markdown("#### Carga manual asistida — funciona aunque el PDF no sea reconocido")
+    clientes = get_clientes(True)
+    with st.form("factura_manual_asistida"):
+        origen = st.selectbox("Origen", ["ARCA", "Emitida por el sistema", "Factura anterior / otro"], key="fm_origen")
+        nom = st.selectbox("Cliente", clientes["nombre"].tolist(), key="fm_cli")
+        c1, c2 = st.columns(2)
+        fecha = c1.date_input("Fecha de emisión", value=date.today(), key="fm_fecha")
+        comp = c2.text_input("Número de comprobante", placeholder="Ej.: 00003-00000125", key="fm_comp")
+        importe = st.number_input("Importe total", min_value=0.0, step=1000.0, key="fm_imp")
+        archivo = st.file_uploader("Adjuntar PDF", type=["pdf"], key="fm_pdf")
+        st.caption("El PDF es recomendable, pero si no lo tenés también podés registrar la factura manualmente.")
+        submitted = st.form_submit_button("Guardar factura en cuenta corriente", type="primary")
         if submitted:
-            cid=int(clientes.loc[clientes["nombre"]==nom,"id"].iloc[0])
-            pdf_path=None
-            if archivo:
-                p=PDF_DIR/(datetime.now().strftime("%Y%m%d%H%M%S_")+archivo.name)
-                p.write_bytes(archivo.getvalue()); pdf_path=str(p)
-            execute("""INSERT INTO movimientos
-            (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (fecha.isoformat(),cid,"Factura/Cargo","Factura",importe,fecha.replace(day=1).isoformat(),
-             comp or None,pdf_path,None,datetime.now().isoformat()))
-            st.success("Factura cargada.")
+            if importe <= 0:
+                st.error("Ingresá un importe mayor a cero.")
+            else:
+                cid = int(clientes.loc[clientes["nombre"] == nom, "id"].iloc[0])
+                pdf_path = None
+                if archivo:
+                    safe_name = datetime.now().strftime("%Y%m%d%H%M%S_%f_") + re.sub(r"[^A-Za-z0-9_.-]", "_", archivo.name)
+                    p = PDF_DIR / safe_name
+                    p.write_bytes(archivo.getvalue())
+                    pdf_path = str(p)
+                try:
+                    execute("""INSERT INTO movimientos
+                    (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (fecha.isoformat(), cid, "Factura/Cargo", f"Factura · Origen: {origen}", float(importe),
+                     fecha.replace(day=1).isoformat(), comp.strip() or None, pdf_path, "Carga manual", datetime.now().isoformat()))
+                    st.success("Factura cargada correctamente.")
+                except sqlite3.IntegrityError:
+                    st.error("Esa factura ya parece estar cargada para este cliente y período. Revisá el número de comprobante.")
 
 with tabs[3]:
     st.subheader("Avisos de pago")
-    periodo=st.date_input("Período", value=date.today().replace(day=1), key="av_periodo")
-    if st.button("Generar avisos del período"):
-        n=generate_monthly_notices(periodo.replace(day=1))
-        st.success(f"Avisos nuevos generados: {n}")
+    periodo = st.date_input("Período", value=date.today().replace(day=1), key="av_periodo").replace(day=1)
+    clientes_aviso = query_df("SELECT * FROM clientes WHERE activo=1 AND modalidad='Aviso de pago' ORDER BY nombre")
+
+    modo_aviso = st.radio("¿Qué querés generar?", ["Un aviso individual", "Todos los avisos del mes"], horizontal=True, key="av_modo")
+
+    if modo_aviso == "Un aviso individual":
+        if len(clientes_aviso) == 0:
+            st.info("No hay clientes configurados con modalidad Aviso de pago.")
+        else:
+            nom_av = st.selectbox("Cliente", clientes_aviso["nombre"].tolist(), key="av_cliente_ind")
+            row_av = clientes_aviso[clientes_aviso["nombre"] == nom_av].iloc[0]
+            importe_av = st.number_input("Importe del aviso", min_value=0.0,
+                                         value=float(row_av["honorario"] or 0), step=1000.0, key="av_importe_ind")
+            st.caption(f"Se generará solamente para {nom_av} · período {periodo.strftime('%m/%Y')}.")
+            if st.button("Generar este aviso", type="primary", key="av_generar_individual"):
+                n, dup = generate_monthly_notices(periodo, int(row_av["id"]), importe_av)
+                if n:
+                    st.success("Aviso generado correctamente.")
+                elif dup:
+                    st.warning("Ese cliente ya tiene un aviso generado para ese período.")
+                else:
+                    st.warning("No se generó ningún aviso.")
+    else:
+        st.warning("Esta opción genera el aviso mensual para TODOS los clientes configurados como Aviso de pago.")
+        confirmar_todos = st.checkbox(f"Confirmo generar todos los avisos de {periodo.strftime('%m/%Y')}", key="av_confirmar_todos")
+        if st.button("Generar TODOS", type="primary", disabled=not confirmar_todos, key="av_generar_todos"):
+            n, dup = generate_monthly_notices(periodo)
+            st.success(f"Avisos nuevos generados: {n}")
+            if dup:
+                st.info(f"Ya existían {dup} avisos para ese período y no se duplicaron.")
+
+    st.divider()
+    st.markdown("#### Avisos del período")
+    avisos_periodo = query_df("""
+        SELECT m.id,m.fecha,c.nombre cliente,m.descripcion,m.importe,m.periodo
+        FROM movimientos m JOIN clientes c ON c.id=m.cliente_id
+        WHERE m.tipo='Aviso de pago' AND m.periodo=?
+        ORDER BY c.nombre
+    """, (periodo.isoformat(),))
+    if len(avisos_periodo):
+        vista_av = avisos_periodo.copy()
+        vista_av["importe"] = vista_av["importe"].map(money)
+        st.dataframe(vista_av, use_container_width=True, hide_index=True)
+        with st.expander("Eliminar un aviso generado por error"):
+            opciones_eliminar = {f"#{int(r['id'])} · {r['cliente']} · {money(r['importe'])}": int(r['id']) for _, r in avisos_periodo.iterrows()}
+            elegido = st.selectbox("Aviso a eliminar", list(opciones_eliminar.keys()), key="av_eliminar_sel")
+            conf_elim = st.checkbox("Confirmo que quiero eliminar este aviso", key="av_eliminar_conf")
+            if st.button("Eliminar aviso", disabled=not conf_elim, key="av_eliminar_btn"):
+                delete_notice(opciones_eliminar[elegido])
+                st.success("Aviso eliminado.")
+                st.rerun()
+    else:
+        st.info("Todavía no hay avisos cargados para este período.")
+
+    st.divider()
+    st.markdown("#### Estado de clientes con aviso de pago")
     avisos = query_df("""
       SELECT c.nombre,c.honorario,
              COALESCE(SUM(m.importe),0) saldo
@@ -2260,9 +2307,9 @@ with tabs[3]:
       GROUP BY c.id,c.nombre,c.honorario ORDER BY c.nombre
     """)
     if len(avisos):
-        avisos["honorario"]=avisos["honorario"].map(money)
-        avisos["saldo"]=avisos["saldo"].map(money)
-    st.dataframe(avisos,use_container_width=True,hide_index=True)
+        avisos["honorario"] = avisos["honorario"].map(money)
+        avisos["saldo"] = avisos["saldo"].map(money)
+    st.dataframe(avisos, use_container_width=True, hide_index=True)
 
 with tabs[4]:
     st.subheader("Registrar pago")
@@ -2415,8 +2462,38 @@ with tabs[8]:
     ORDER BY m.fecha DESC,m.id DESC
     """)
     if len(mov):
-        mov["importe_fmt"]=mov["importe"].map(money)
-    st.dataframe(mov.drop(columns=["importe"],errors="ignore"),use_container_width=True,hide_index=True)
+        mov["importe_fmt"] = mov["importe"].map(money)
+    st.dataframe(mov.drop(columns=["importe"], errors="ignore"), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### Revisar movimientos duplicados")
+    st.caption("No se borra nada automáticamente. Acá podés detectar registros exactamente repetidos y decidir cuál eliminar.")
+    duplicados = query_df("""
+        SELECT c.nombre cliente,m.fecha,m.tipo,m.descripcion,m.importe,m.periodo,m.comprobante,
+               COUNT(*) cantidad, GROUP_CONCAT(m.id) ids
+        FROM movimientos m JOIN clientes c ON c.id=m.cliente_id
+        GROUP BY m.cliente_id,m.fecha,m.tipo,COALESCE(m.descripcion,''),m.importe,COALESCE(m.periodo,''),COALESCE(m.comprobante,'')
+        HAVING COUNT(*) > 1
+        ORDER BY cantidad DESC,c.nombre,m.fecha
+    """)
+    if len(duplicados):
+        dup_vista = duplicados.copy()
+        dup_vista["importe"] = dup_vista["importe"].map(money)
+        st.dataframe(dup_vista, use_container_width=True, hide_index=True)
+        st.warning("Estos son duplicados exactos. Si querés eliminar alguno, hacelo de a uno para no borrar información válida.")
+        ids_disponibles = []
+        for raw_ids in duplicados["ids"].astype(str):
+            parts = [int(x) for x in raw_ids.split(",") if x.strip().isdigit()]
+            ids_disponibles.extend(parts[1:])
+        if ids_disponibles:
+            id_borrar = st.selectbox("ID duplicado a eliminar", sorted(set(ids_disponibles)), key="cc_dup_id")
+            conf_dup = st.checkbox("Confirmo eliminar solamente este movimiento duplicado", key="cc_dup_conf")
+            if st.button("Eliminar duplicado seleccionado", disabled=not conf_dup, key="cc_dup_del"):
+                execute("DELETE FROM movimientos WHERE id=?", (int(id_borrar),))
+                st.success("Movimiento duplicado eliminado.")
+                st.rerun()
+    else:
+        st.success("No se detectan movimientos exactamente duplicados.")
 
 with tabs[9]:
     st.subheader("Exportar a Excel")
@@ -2593,11 +2670,6 @@ with tabs[10]:
             cdl.download_button("Descargar PDF", data=Path(p).read_bytes(), file_name=Path(p).name, mime="application/pdf", key=f"pdf_{sel_id}")
         else:
             cdl.info("PDF todavía no disponible")
-        if cdl.button("Regenerar PDF formato ARCA", key=f"regen_{sel_id}"):
-            ok, msg = regenerar_pdf_autorizada(int(sel_id))
-            (st.success if ok else st.error)(msg)
-            if ok:
-                st.rerun()
         if csend.button("Enviar / reenviar factura", key=f"send_{sel_id}"):
             ok, msg = enviar_factura_por_email(int(sel_id))
             (st.success if ok else st.error)(msg)
