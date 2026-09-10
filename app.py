@@ -214,6 +214,11 @@ def init_db():
     add_col("emisores", "ambiente_arca", "TEXT DEFAULT 'HOMOLOGACION'")
     add_col("emisores", "precios_incluyen_iva", "INTEGER DEFAULT 1")
 
+    # Clasificación administrativa del cliente
+    # Mensual: forma parte de la cartera recurrente. Ocasional: trabajos/facturas aisladas.
+    add_col("clientes", "tipo_cliente", "TEXT DEFAULT 'Mensual'")
+    conn.execute("UPDATE clientes SET tipo_cliente='Mensual' WHERE tipo_cliente IS NULL OR TRIM(tipo_cliente)='' ")
+
     # Datos fiscales del receptor
     add_col("clientes", "domicilio", "TEXT")
     add_col("clientes", "condicion_iva_receptor_id", "INTEGER")
@@ -1830,32 +1835,38 @@ def parse_arg_money(s):
         return None
 
 def parse_invoice(text):
-    """Intenta leer facturas PDF, incluidas las descargadas desde ARCA."""
-    out = {"cuit": None, "fecha": None, "comprobante": None, "importe": None}
+    """Lee facturas PDF, especialmente comprobantes descargados de ARCA.
+
+    Devuelve todos los CUIT encontrados para que resolve_cliente pueda cruzarlos
+    contra la base y no dependa del orden del texto extraído por el PDF.
+    """
+    out = {"cuit": None, "cuits": [], "fecha": None, "comprobante": None, "importe": None}
     if not text:
         return out
 
-    clean = re.sub(r"[\u00a0\t]+", " ", text)
+    # pypdf puede insertar saltos de línea/espacios en lugares distintos según el PDF.
+    clean = text.replace("\u00a0", " ").replace("\t", " ")
+    flat = re.sub(r"\s+", " ", clean).strip()
 
-    # CUIT receptor: en PDFs ARCA puede aparecer como CUIT, CUIT Nro. o CUIT:.
-    cuit_patterns = [
-        r"CUIT(?:\s+Nro\.?|\s+N[°ºo]\.?)?[:\s]*(\d{2}[-\s]?\d{8}[-\s]?\d)",
-        r"Doc\.?\s*(?:Nro\.?|N[°ºo]\.?)?[:\s]*(\d{11})",
-    ]
-    cuits = []
-    for pat in cuit_patterns:
-        cuits += re.findall(pat, clean, re.I)
-    if cuits:
-        # El último CUIT suele corresponder al receptor en la factura ARCA.
-        out["cuit"] = re.sub(r"\D", "", cuits[-1])
+    # Todos los CUIT que aparezcan. Luego se cruzan con clientes/emisores conocidos.
+    cuit_candidates = re.findall(r"(?<!\d)(\d{2}[\s\-.]?\d{8}[\s\-.]?\d)(?!\d)", flat)
+    seen = []
+    for c in cuit_candidates:
+        d = re.sub(r"\D", "", c)
+        if len(d) == 11 and d not in seen:
+            seen.append(d)
+    out["cuits"] = seen
+    if seen:
+        out["cuit"] = seen[-1]
 
     fecha_patterns = [
-        r"Fecha(?:\s+de)?\s+Emisi[oó]n[:\s]*(\d{1,2}/\d{1,2}/\d{4})",
-        r"Fecha[:\s]*(\d{1,2}/\d{1,2}/\d{4})",
-        r"Emisi[oó]n[:\s]*(\d{1,2}/\d{1,2}/\d{4})",
+        r"Fecha\s+de\s+Emisi[oó]n\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})",
+        r"Fecha\s+Emisi[oó]n\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})",
+        r"Fecha\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})",
+        r"Emisi[oó]n\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})",
     ]
     for pat in fecha_patterns:
-        m = re.search(pat, clean, re.I)
+        m = re.search(pat, flat, re.I)
         if m:
             try:
                 out["fecha"] = datetime.strptime(m.group(1), "%d/%m/%Y").date()
@@ -1863,47 +1874,59 @@ def parse_invoice(text):
             except Exception:
                 pass
 
-    comp_patterns = [
-        r"Comp\.?\s*Nro\.?[:\s]*(\d{4,5}-\d{6,8})",
-        r"Comprobante(?:\s+Nro\.?|\s+N[°ºo]\.?)?[:\s]*(\d{4,5}-\d{6,8})",
-        r"Factura\s+[ABC]?(?:\s+N[°ºo]\.?)?[:\s]*(\d{4,5}-\d{6,8})",
-        r"Punto de Venta[:\s]*(\d{1,5}).{0,80}?(?:Comp\.?\s*Nro\.?|N[°ºo]\.? de Comp\.?)[^\d]*(\d{1,8})",
-    ]
-    for pat in comp_patterns:
-        m = re.search(pat, clean, re.I | re.S)
-        if m:
-            if len(m.groups()) == 2:
+    # ARCA suele mostrar Punto de Venta y Comp. Nro. juntos, aunque pypdf puede separarlos.
+    pv = re.search(r"Punto\s+de\s+Venta\s*:?\s*(\d{1,5})", flat, re.I)
+    nro = re.search(r"(?:Comp\.?|Comprobante)\s*Nro\.?\s*:?\s*(\d{1,8})", flat, re.I)
+    if pv and nro:
+        out["comprobante"] = f"{int(pv.group(1)):05d}-{int(nro.group(1)):08d}"
+    else:
+        comp_patterns = [
+            r"(?:Comp\.?|Comprobante)\s*(?:Nro\.?|N[°ºo]\.?)?\s*:?\s*(\d{4,5})\s*[-–]\s*(\d{1,8})",
+            r"Factura\s+[ABC]?\s*(?:Nro\.?|N[°ºo]\.?)?\s*:?\s*(\d{4,5})\s*[-–]\s*(\d{1,8})",
+            r"(?<!\d)(\d{4,5})\s*[-–]\s*(\d{6,8})(?!\d)",
+        ]
+        for pat in comp_patterns:
+            m = re.search(pat, flat, re.I)
+            if m:
                 out["comprobante"] = f"{int(m.group(1)):05d}-{int(m.group(2)):08d}"
-            else:
-                out["comprobante"] = re.sub(r"\s+", " ", m.group(1)).strip()
-            break
+                break
 
+    # Tomar prioritariamente el importe que sigue a 'Importe Total'.
     total_patterns = [
-        r"Importe\s+Total[:\s$]*([\d\.\,]+)",
-        r"Total\s+Comprobante[:\s$]*([\d\.\,]+)",
-        r"TOTAL[:\s$]*([\d\.\,]+)",
-        r"Total[:\s$]*([\d\.\,]+)",
+        r"Importe\s+Total\s*:?\s*\$?\s*([\d\.]+(?:,\d{1,2})?)",
+        r"Total\s+Comprobante\s*:?\s*\$?\s*([\d\.]+(?:,\d{1,2})?)",
+        r"Total\s*:?\s*\$?\s*([\d\.]+(?:,\d{1,2})?)",
     ]
-    vals = []
     for pat in total_patterns:
-        for m in re.findall(pat, clean, re.I):
+        vals = []
+        for m in re.findall(pat, flat, re.I):
             v = parse_arg_money(m)
             if v and v > 0:
                 vals.append(v)
-    if vals:
-        # En facturas ARCA pueden aparecer subtotales; el importe total suele ser el mayor valor.
-        out["importe"] = max(vals)
+        if vals:
+            out["importe"] = max(vals)
+            break
     return out
+
 
 def resolve_cliente(parsed, filename):
     clientes = get_clientes(True)
-    if parsed.get("cuit"):
-        m = clientes[clientes["cuit"].fillna("").astype(str).str.replace(r"\D","",regex=True)==parsed["cuit"]]
-        if len(m)==1:
-            return int(m.iloc[0]["id"]), m.iloc[0]["nombre"]
+
+    # Cruce contra TODOS los CUIT hallados en el PDF. Esto evita confundir CUIT emisor/receptor.
+    found_cuits = list(parsed.get("cuits") or [])
+    if parsed.get("cuit") and parsed.get("cuit") not in found_cuits:
+        found_cuits.append(parsed.get("cuit"))
+    if found_cuits:
+        norm = clientes["cuit"].fillna("").astype(str).str.replace(r"\D", "", regex=True)
+        for cuit in found_cuits:
+            m = clientes[norm == cuit]
+            if len(m) == 1:
+                return int(m.iloc[0]["id"]), m.iloc[0]["nombre"]
+
+    # Segundo intento: nombre del cliente en el nombre del archivo.
     low = filename.lower()
-    for _,r in clientes.iterrows():
-        words=[w.lower() for w in re.findall(r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9]+",r["nombre"]) if len(w)>=5]
+    for _, r in clientes.iterrows():
+        words = [w.lower() for w in re.findall(r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9]+", r["nombre"]) if len(w) >= 5]
         if any(w in low for w in words):
             return int(r["id"]), r["nombre"]
     return None, None
@@ -1981,7 +2004,7 @@ def crear_o_recuperar_cliente_ocasional(nombre, documento, condicion_desc, email
                                LIMIT 1""", (d,))
         if len(existente):
             cid = int(existente.iloc[0]["id"])
-            execute("""UPDATE clientes SET nombre=?,activo=1,modalidad='Factura',
+            execute("""UPDATE clientes SET nombre=?,activo=1,modalidad='Factura',tipo_cliente='Ocasional',
                        condicion_iva_receptor_id=?,condicion_iva_receptor_desc=?,
                        email_facturacion=COALESCE(NULLIF(?,''),email_facturacion)
                        WHERE id=?""",
@@ -1993,9 +2016,9 @@ def crear_o_recuperar_cliente_ocasional(nombre, documento, condicion_desc, email
         guardar_datos_fiscales_cliente(cid, condicion_desc, documento, email)
         return cid
     execute("""INSERT INTO clientes(
-                nombre,cuit,modalidad,honorario,vigente_desde,dia_generacion,activo,observaciones,
+                nombre,cuit,modalidad,tipo_cliente,honorario,vigente_desde,dia_generacion,activo,observaciones,
                 email_facturacion,envio_automatico_factura,condicion_iva_receptor_id,condicion_iva_receptor_desc
-              ) VALUES(?,?, 'Factura',0,?,1,1,'Cliente ocasional creado al facturar',?,1,?,?)""",
+              ) VALUES(?,?, 'Factura','Ocasional',0,?,1,1,'Cliente ocasional creado al facturar',?,1,?,?)""",
             (nombre, documento or None, date.today().replace(day=1).isoformat(),
              email.strip() or None, cond_id, condicion_desc))
     return int(query_df("SELECT id FROM clientes WHERE UPPER(nombre)=UPPER(?) ORDER BY id DESC LIMIT 1", (nombre,)).iloc[0]["id"])
@@ -2026,7 +2049,7 @@ with tabs[0]:
     show = saldos.copy()
     show["honorario"] = show["honorario"].map(money)
     show["saldo"] = show["saldo"].map(money)
-    st.dataframe(show[["nombre","modalidad","honorario","saldo"]], use_container_width=True, hide_index=True)
+    st.dataframe(show[["nombre","tipo_cliente","modalidad","honorario","saldo"]], use_container_width=True, hide_index=True)
 
 
 with tabs[1]:
@@ -2182,6 +2205,15 @@ with tabs[2]:
         df = pd.DataFrame(parsed_rows)
         st.dataframe(df[["archivo", "cliente", "fecha", "comprobante", "importe", "estado"]], use_container_width=True, hide_index=True)
         st.caption("Se guardan automáticamente sólo las filas reconocidas. Las que digan REVISAR podés cargarlas en el formulario manual de abajo sin perder el PDF.")
+        with st.expander("Diagnóstico de lectura ARCA"):
+            st.caption("Sirve para ver qué está pudiendo leer el sistema del PDF. No guarda nada.")
+            for f in archivos_pdf:
+                raw = file_map[f.name]
+                txt = extract_pdf_text(io.BytesIO(raw))
+                par = parse_invoice(txt)
+                st.markdown(f"**{f.name}**")
+                st.write({"CUIT encontrados": par.get("cuits", []), "fecha": par.get("fecha"), "comprobante": par.get("comprobante"), "importe": par.get("importe")})
+                st.text_area("Texto extraído", value=txt[:5000] if txt else "(sin texto extraíble)", height=180, key=f"diag_{f.name}")
 
         if st.button("Confirmar facturas reconocidas", type="primary", key="confirmar_lote_facturas"):
             ok = 0
@@ -2209,10 +2241,24 @@ with tabs[2]:
 
     st.divider()
     st.markdown("#### Carga manual asistida — funciona aunque el PDF no sea reconocido")
+    st.caption("También permite incorporar una factura anterior de un cliente ocasional que todavía no existe en el control.")
     clientes = get_clientes(True)
     with st.form("factura_manual_asistida"):
         origen = st.selectbox("Origen", ["ARCA", "Emitida por el sistema", "Factura anterior / otro"], key="fm_origen")
-        nom = st.selectbox("Cliente", clientes["nombre"].tolist(), key="fm_cli")
+        modo_fm = st.radio("Cliente", ["Cliente existente", "Nuevo cliente ocasional"], horizontal=True, key="fm_modo_cliente")
+
+        if modo_fm == "Cliente existente":
+            nom = st.selectbox("Cliente", clientes["nombre"].tolist(), key="fm_cli")
+            nuevo_nombre = nuevo_cuit = nuevo_email = ""
+            nueva_cond = ""
+        else:
+            st.info("Este cliente se guardará como OCASIONAL: aparecerá en el control, pero no se considerará un cliente mensual recurrente.")
+            nuevo_nombre = st.text_input("Nombre / razón social", key="fm_nuevo_nombre")
+            nuevo_cuit = st.text_input("CUIT / DNI", key="fm_nuevo_cuit")
+            nueva_cond = st.selectbox("Condición frente al IVA", [""] + list(IVA_RECEPTOR_OPCIONES.keys()), key="fm_nueva_cond")
+            nuevo_email = st.text_input("Email (opcional)", key="fm_nuevo_email")
+            nom = ""
+
         c1, c2 = st.columns(2)
         fecha = c1.date_input("Fecha de emisión", value=date.today(), key="fm_fecha")
         comp = c2.text_input("Número de comprobante", placeholder="Ej.: 00003-00000125", key="fm_comp")
@@ -2223,23 +2269,49 @@ with tabs[2]:
         if submitted:
             if importe <= 0:
                 st.error("Ingresá un importe mayor a cero.")
+            elif modo_fm == "Nuevo cliente ocasional" and not nuevo_nombre.strip():
+                st.error("Ingresá el nombre o razón social del cliente ocasional.")
             else:
-                cid = int(clientes.loc[clientes["nombre"] == nom, "id"].iloc[0])
-                pdf_path = None
-                if archivo:
-                    safe_name = datetime.now().strftime("%Y%m%d%H%M%S_%f_") + re.sub(r"[^A-Za-z0-9_.-]", "_", archivo.name)
-                    p = PDF_DIR / safe_name
-                    p.write_bytes(archivo.getvalue())
-                    pdf_path = str(p)
                 try:
+                    if modo_fm == "Cliente existente":
+                        cid = int(clientes.loc[clientes["nombre"] == nom, "id"].iloc[0])
+                    else:
+                        # Para una factura histórica no obligamos a tener todos los datos fiscales.
+                        existente = None
+                        d = digits(nuevo_cuit) if nuevo_cuit else ""
+                        if d:
+                            ex = query_df("""SELECT id FROM clientes
+                                             WHERE REPLACE(REPLACE(REPLACE(COALESCE(cuit,''),'-',''),' ',''),'.','')=? LIMIT 1""", (d,))
+                            if len(ex):
+                                existente = int(ex.iloc[0]["id"])
+                        if existente:
+                            cid = existente
+                            execute("UPDATE clientes SET activo=1, tipo_cliente='Ocasional' WHERE id=?", (cid,))
+                        else:
+                            cond_id = IVA_RECEPTOR_OPCIONES.get(nueva_cond) if nueva_cond else None
+                            cid = execute("""INSERT INTO clientes(
+                                nombre,cuit,modalidad,tipo_cliente,honorario,vigente_desde,dia_generacion,activo,observaciones,
+                                email_facturacion,envio_automatico_factura,condicion_iva_receptor_id,condicion_iva_receptor_desc
+                            ) VALUES(?,?, 'Factura','Ocasional',0,?,1,1,'Cliente ocasional creado al cargar factura histórica',?,0,?,?)""",
+                            (nuevo_nombre.strip(), nuevo_cuit.strip() or None, fecha.replace(day=1).isoformat(),
+                             nuevo_email.strip() or None, int(cond_id) if cond_id else None, nueva_cond or None))
+
+                    pdf_path = None
+                    if archivo:
+                        safe_name = datetime.now().strftime("%Y%m%d%H%M%S_%f_") + re.sub(r"[^A-Za-z0-9_.-]", "_", archivo.name)
+                        p = PDF_DIR / safe_name
+                        p.write_bytes(archivo.getvalue())
+                        pdf_path = str(p)
                     execute("""INSERT INTO movimientos
                     (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
                     VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (fecha.isoformat(), cid, "Factura/Cargo", f"Factura · Origen: {origen}", float(importe),
                      fecha.replace(day=1).isoformat(), comp.strip() or None, pdf_path, "Carga manual", datetime.now().isoformat()))
-                    st.success("Factura cargada correctamente.")
+                    st.success("Factura cargada correctamente. El cliente también quedó incorporado al control." if modo_fm == "Nuevo cliente ocasional" else "Factura cargada correctamente.")
                 except sqlite3.IntegrityError:
-                    st.error("Esa factura ya parece estar cargada para este cliente y período. Revisá el número de comprobante.")
+                    st.error("Esa factura ya parece estar cargada para este cliente y período, o el nombre del cliente ya existe. Revisá los datos.")
+                except Exception as e:
+                    st.error(f"No se pudo guardar: {e}")
 
 with tabs[3]:
     st.subheader("Avisos de pago")
@@ -2356,8 +2428,9 @@ with tabs[6]:
         with st.form("nuevo_cliente"):
             n=st.text_input("Nombre")
             cuit=st.text_input("CUIT")
-            mod=st.selectbox("Modalidad",["Factura","Aviso de pago"])
-            hon=st.number_input("Honorario vigente",min_value=0.0,step=1000.0)
+            tipo_cliente=st.radio("Tipo de cliente",["Mensual","Ocasional"],horizontal=True,help="Mensual = cliente recurrente. Ocasional = trabajos o facturas aisladas.")
+            mod=st.selectbox("Forma de cobro",["Factura","Aviso de pago"],help="Esto es independiente de que el cliente sea mensual u ocasional.")
+            hon=st.number_input("Honorario vigente",min_value=0.0,step=1000.0,help="Para un cliente ocasional puede quedar en $0.")
             vd=st.date_input("Vigente desde",value=date.today().replace(day=1))
             domicilio=st.text_input("Domicilio fiscal / comercial")
             cond_desc=st.selectbox("Condición frente al IVA", [""] + list(IVA_RECEPTOR_OPCIONES.keys()), key="nc_cond")
@@ -2365,10 +2438,10 @@ with tabs[6]:
             email_fact=st.text_input("Email de facturación")
             envio_auto=st.checkbox("Enviar factura automáticamente por email", value=True)
             if st.form_submit_button("Crear cliente"):
-                execute("""INSERT INTO clientes(nombre,cuit,modalidad,honorario,vigente_desde,dia_generacion,activo,email_facturacion,envio_automatico_factura,domicilio,condicion_iva_receptor_id,condicion_iva_receptor_desc)
-                VALUES(?,?,?,?,?,?,1,?,?,?,?,?)""",(n,cuit or None,mod,hon,vd.isoformat(),1,email_fact.strip() or None,1 if envio_auto else 0,
+                execute("""INSERT INTO clientes(nombre,cuit,modalidad,tipo_cliente,honorario,vigente_desde,dia_generacion,activo,email_facturacion,envio_automatico_factura,domicilio,condicion_iva_receptor_id,condicion_iva_receptor_desc)
+                VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?)""",(n,cuit or None,mod,tipo_cliente,hon,vd.isoformat(),1,email_fact.strip() or None,1 if envio_auto else 0,
                 domicilio.strip() or None, int(cond_id) if cond_id else None, cond_desc or None))
-                st.success("Cliente creado.")
+                st.success(f"Cliente creado como {tipo_cliente}.")
     with c2:
         st.markdown("#### Cambiar honorario")
         activos=get_clientes(True)
