@@ -1970,12 +1970,12 @@ def delete_notice(movimiento_id):
 
 def balances_df():
     return query_df("""
-    SELECT c.id, c.nombre, c.modalidad, c.honorario,
+    SELECT c.id, c.nombre, c.tipo_cliente, c.modalidad, c.honorario,
            COALESCE(SUM(m.importe),0) AS saldo
     FROM clientes c
     LEFT JOIN movimientos m ON m.cliente_id=c.id
     WHERE c.activo=1
-    GROUP BY c.id,c.nombre,c.modalidad,c.honorario
+    GROUP BY c.id,c.nombre,c.tipo_cliente,c.modalidad,c.honorario
     ORDER BY saldo DESC, c.nombre
     """)
 
@@ -2047,6 +2047,15 @@ with tabs[0]:
     st.caption("Base actualizada desde Control de cuentas(1).xlsx · saldo fuente: $ 14.217.700.")
     st.subheader("Estado por cliente")
     show = saldos.copy()
+    # Compatibilidad defensiva con bases anteriores
+    if "tipo_cliente" not in show.columns:
+        show["tipo_cliente"] = "Mensual"
+    if "modalidad" not in show.columns:
+        show["modalidad"] = ""
+    if "honorario" not in show.columns:
+        show["honorario"] = 0
+    if "saldo" not in show.columns:
+        show["saldo"] = 0
     show["honorario"] = show["honorario"].map(money)
     show["saldo"] = show["saldo"].map(money)
     st.dataframe(show[["nombre","tipo_cliente","modalidad","honorario","saldo"]], use_container_width=True, hide_index=True)
