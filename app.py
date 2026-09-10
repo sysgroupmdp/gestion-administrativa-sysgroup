@@ -2446,25 +2446,81 @@ with tabs[6]:
             cond_id=IVA_RECEPTOR_OPCIONES.get(cond_desc)
             email_fact=st.text_input("Email de facturación")
             envio_auto=st.checkbox("Enviar factura automáticamente por email", value=True)
+            generar_primer_aviso = False
+            if mod == "Aviso de pago":
+                generar_primer_aviso = st.checkbox(
+                    "Generar ahora el aviso del período vigente",
+                    value=False,
+                    help="Solo si querés que el alta del cliente también cree el cargo en la cuenta corriente. Si lo dejás desmarcado, el cliente se crea sin generar deuda."
+                )
             if st.form_submit_button("Crear cliente"):
-                execute("""INSERT INTO clientes(nombre,cuit,modalidad,tipo_cliente,honorario,vigente_desde,dia_generacion,activo,email_facturacion,envio_automatico_factura,domicilio,condicion_iva_receptor_id,condicion_iva_receptor_desc)
+                cid_nuevo = execute("""INSERT INTO clientes(nombre,cuit,modalidad,tipo_cliente,honorario,vigente_desde,dia_generacion,activo,email_facturacion,envio_automatico_factura,domicilio,condicion_iva_receptor_id,condicion_iva_receptor_desc)
                 VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?)""",(n,cuit or None,mod,tipo_cliente,hon,vd.isoformat(),1,email_fact.strip() or None,1 if envio_auto else 0,
                 domicilio.strip() or None, int(cond_id) if cond_id else None, cond_desc or None))
-                st.success(f"Cliente creado como {tipo_cliente}.")
+                if mod == "Aviso de pago" and generar_primer_aviso and hon > 0:
+                    generados, duplicados = generate_monthly_notices(vd.replace(day=1), cliente_id=cid_nuevo, importe_override=hon)
+                    if generados:
+                        st.success(f"Cliente creado como {tipo_cliente} y aviso generado por {money(hon)}.")
+                    else:
+                        st.success(f"Cliente creado como {tipo_cliente}.")
+                        if duplicados:
+                            st.warning("El aviso de ese período ya existía y no se duplicó.")
+                else:
+                    st.success(f"Cliente creado como {tipo_cliente}. No se generó ningún movimiento automáticamente.")
     with c2:
-        st.markdown("#### Cambiar honorario")
+        st.markdown("#### Editar cliente / honorario")
         activos=get_clientes(True)
-        with st.form("cambio_honorario"):
+        if len(activos):
             nom=st.selectbox("Cliente",activos["nombre"].tolist(),key="ch_cli")
-            nuevo=st.number_input("Nuevo honorario",min_value=0.0,step=1000.0,key="ch_imp")
-            vig=st.date_input("Vigente desde",value=date.today().replace(day=1),key="ch_vig")
-            nota=st.text_input("Nota",value="Actualización manual")
-            if st.form_submit_button("Guardar nuevo honorario"):
-                cid=int(activos.loc[activos["nombre"]==nom,"id"].iloc[0])
-                execute("INSERT INTO honorarios(cliente_id,vigente_desde,honorario,nota) VALUES(?,?,?,?)",
-                        (cid,vig.isoformat(),nuevo,nota))
-                execute("UPDATE clientes SET honorario=?, vigente_desde=? WHERE id=?",(nuevo,vig.isoformat(),cid))
-                st.success("Honorario actualizado. Los movimientos anteriores no cambian.")
+            actual=activos.loc[activos["nombre"]==nom].iloc[0]
+            modalidad_actual = str(actual.get("modalidad") or "Factura")
+            tipo_actual = str(actual.get("tipo_cliente") or "Mensual")
+            opciones_mod = ["Factura","Aviso de pago"]
+            opciones_tipo = ["Mensual","Ocasional"]
+            with st.form("editar_cliente_cobro"):
+                nueva_modalidad=st.selectbox(
+                    "Forma de cobro", opciones_mod,
+                    index=opciones_mod.index(modalidad_actual) if modalidad_actual in opciones_mod else 0,
+                    key="ch_modalidad"
+                )
+                nuevo_tipo=st.selectbox(
+                    "Tipo de cliente", opciones_tipo,
+                    index=opciones_tipo.index(tipo_actual) if tipo_actual in opciones_tipo else 0,
+                    key="ch_tipo"
+                )
+                nuevo=st.number_input(
+                    "Honorario vigente", min_value=0.0, step=1000.0,
+                    value=float(actual.get("honorario") or 0), key="ch_imp"
+                )
+                vig_val = pd.to_datetime(actual.get("vigente_desde"), errors="coerce")
+                vig_default = vig_val.date() if pd.notna(vig_val) else date.today().replace(day=1)
+                vig=st.date_input("Vigente desde",value=vig_default,key="ch_vig")
+                nota=st.text_input("Nota",value="Actualización manual")
+                generar_aviso_ahora=st.checkbox(
+                    "Si queda como Aviso de pago, generar también el aviso de este período",
+                    value=False,
+                    help="Es opcional. Guardar la modalidad u honorario no crea deuda por sí solo."
+                )
+                if st.form_submit_button("Guardar cambios"):
+                    cid=int(actual["id"])
+                    execute("INSERT INTO honorarios(cliente_id,vigente_desde,honorario,nota) VALUES(?,?,?,?)",
+                            (cid,vig.isoformat(),nuevo,nota))
+                    execute("UPDATE clientes SET honorario=?, vigente_desde=?, modalidad=?, tipo_cliente=? WHERE id=?",
+                            (nuevo,vig.isoformat(),nueva_modalidad,nuevo_tipo,cid))
+                    if nueva_modalidad == "Aviso de pago" and generar_aviso_ahora and nuevo > 0:
+                        generados, duplicados = generate_monthly_notices(vig.replace(day=1), cliente_id=cid, importe_override=nuevo)
+                        if generados:
+                            st.success(f"Cambios guardados y aviso generado por {money(nuevo)}.")
+                        elif duplicados:
+                            st.success("Cambios guardados.")
+                            st.warning("El aviso de ese período ya existía y no se duplicó.")
+                        else:
+                            st.success("Cambios guardados.")
+                    else:
+                        st.success("Cambios guardados. Los movimientos anteriores no cambian.")
+                    st.rerun()
+        else:
+            st.info("No hay clientes activos para editar.")
 
     st.divider()
     st.subheader("Emisor habitual por cliente")
