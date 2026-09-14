@@ -2468,7 +2468,7 @@ with tabs[6]:
                 else:
                     st.success(f"Cliente creado como {tipo_cliente}. No se generó ningún movimiento automáticamente.")
     with c2:
-        st.markdown("#### Editar cliente / honorario")
+        st.markdown("#### Editar cliente")
         activos=get_clientes(True)
         if len(activos):
             nom=st.selectbox("Cliente",activos["nombre"].tolist(),key="ch_cli")
@@ -2477,7 +2477,24 @@ with tabs[6]:
             tipo_actual = str(actual.get("tipo_cliente") or "Mensual")
             opciones_mod = ["Factura","Aviso de pago"]
             opciones_tipo = ["Mensual","Ocasional"]
-            with st.form("editar_cliente_cobro"):
+
+            cond_actual_desc = str(actual.get("condicion_iva_receptor_desc") or "")
+            cond_opciones = [""] + list(IVA_RECEPTOR_OPCIONES.keys())
+            cond_index = cond_opciones.index(cond_actual_desc) if cond_actual_desc in cond_opciones else 0
+
+            with st.form("editar_cliente_completo"):
+                nombre_edit=st.text_input("Nombre / Razón social", value=str(actual.get("nombre") or ""), key="ch_nombre")
+                e1,e2=st.columns(2)
+                cuit_edit=e1.text_input("CUIT", value=str(actual.get("cuit") or ""), key="ch_cuit")
+                domicilio_edit=e2.text_input("Domicilio fiscal / comercial", value=str(actual.get("domicilio") or ""), key="ch_dom")
+
+                cond_edit=st.selectbox("Condición frente al IVA", cond_opciones, index=cond_index, key="ch_cond")
+                cond_id_edit=IVA_RECEPTOR_OPCIONES.get(cond_edit)
+
+                m1,m2=st.columns([2,1])
+                email_edit=m1.text_input("Email de facturación", value=str(actual.get("email_facturacion") or ""), key="ch_email")
+                envio_auto_edit=m2.checkbox("Envío automático", value=bool(int(actual.get("envio_automatico_factura") or 0)), key="ch_envio_auto")
+
                 nueva_modalidad=st.selectbox(
                     "Forma de cobro", opciones_mod,
                     index=opciones_mod.index(modalidad_actual) if modalidad_actual in opciones_mod else 0,
@@ -2499,26 +2516,59 @@ with tabs[6]:
                 generar_aviso_ahora=st.checkbox(
                     "Si queda como Aviso de pago, generar también el aviso de este período",
                     value=False,
-                    help="Es opcional. Guardar la modalidad u honorario no crea deuda por sí solo."
+                    help="Es opcional. Guardar los datos del cliente no crea deuda por sí solo."
                 )
-                if st.form_submit_button("Guardar cambios"):
+
+                if st.form_submit_button("Guardar cambios", type="primary"):
                     cid=int(actual["id"])
-                    execute("INSERT INTO honorarios(cliente_id,vigente_desde,honorario,nota) VALUES(?,?,?,?)",
-                            (cid,vig.isoformat(),nuevo,nota))
-                    execute("UPDATE clientes SET honorario=?, vigente_desde=?, modalidad=?, tipo_cliente=? WHERE id=?",
-                            (nuevo,vig.isoformat(),nueva_modalidad,nuevo_tipo,cid))
-                    if nueva_modalidad == "Aviso de pago" and generar_aviso_ahora and nuevo > 0:
-                        generados, duplicados = generate_monthly_notices(vig.replace(day=1), cliente_id=cid, importe_override=nuevo)
-                        if generados:
-                            st.success(f"Cambios guardados y aviso generado por {money(nuevo)}.")
-                        elif duplicados:
-                            st.success("Cambios guardados.")
-                            st.warning("El aviso de ese período ya existía y no se duplicó.")
-                        else:
-                            st.success("Cambios guardados.")
+                    nombre_limpio=nombre_edit.strip()
+                    email_limpio=email_edit.strip()
+                    cuit_limpio=cuit_edit.strip()
+                    domicilio_limpio=domicilio_edit.strip()
+
+                    if not nombre_limpio:
+                        st.error("El nombre / razón social no puede quedar vacío.")
+                    elif email_limpio and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_limpio):
+                        st.error("Revisá el email de facturación: no parece válido.")
                     else:
-                        st.success("Cambios guardados. Los movimientos anteriores no cambian.")
-                    st.rerun()
+                        duplicado_nombre=query_df(
+                            "SELECT id FROM clientes WHERE UPPER(nombre)=UPPER(?) AND id<>? LIMIT 1",
+                            (nombre_limpio,cid)
+                        )
+                        if len(duplicado_nombre):
+                            st.error("Ya existe otro cliente con ese nombre / razón social.")
+                        else:
+                            honorario_anterior=float(actual.get("honorario") or 0)
+                            vigente_anterior=str(actual.get("vigente_desde") or "")
+                            if nuevo != honorario_anterior or vig.isoformat() != vigente_anterior:
+                                execute(
+                                    "INSERT INTO honorarios(cliente_id,vigente_desde,honorario,nota) VALUES(?,?,?,?)",
+                                    (cid,vig.isoformat(),nuevo,nota)
+                                )
+
+                            execute("""UPDATE clientes SET
+                                      nombre=?, cuit=?, domicilio=?,
+                                      condicion_iva_receptor_id=?, condicion_iva_receptor_desc=?,
+                                      email_facturacion=?, envio_automatico_factura=?,
+                                      honorario=?, vigente_desde=?, modalidad=?, tipo_cliente=?
+                                      WHERE id=?""",
+                                    (nombre_limpio, cuit_limpio or None, domicilio_limpio or None,
+                                     int(cond_id_edit) if cond_id_edit else None, cond_edit or None,
+                                     email_limpio or None, 1 if envio_auto_edit else 0,
+                                     nuevo, vig.isoformat(), nueva_modalidad, nuevo_tipo, cid))
+
+                            if nueva_modalidad == "Aviso de pago" and generar_aviso_ahora and nuevo > 0:
+                                generados, duplicados = generate_monthly_notices(vig.replace(day=1), cliente_id=cid, importe_override=nuevo)
+                                if generados:
+                                    st.success(f"Cliente actualizado y aviso generado por {money(nuevo)}.")
+                                elif duplicados:
+                                    st.success("Cliente actualizado.")
+                                    st.warning("El aviso de ese período ya existía y no se duplicó.")
+                                else:
+                                    st.success("Cliente actualizado.")
+                            else:
+                                st.success("Cliente actualizado. Su historial, pagos y movimientos anteriores se mantienen sin cambios.")
+                            st.rerun()
         else:
             st.info("No hay clientes activos para editar.")
 
@@ -2535,42 +2585,6 @@ with tabs[6]:
             cid = int(clientes_asig.loc[clientes_asig["nombre"] == ca, "id"].iloc[0])
             execute("UPDATE clientes SET emisor_predeterminado_id=? WHERE id=?", (em_map[ea], cid))
             st.success("Emisor habitual actualizado.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Datos fiscales del cliente")
-    clientes_fisc = get_clientes(True)
-    if len(clientes_fisc):
-        cf = st.selectbox("Cliente para datos fiscales", clientes_fisc["nombre"].tolist(), key="fisc_cliente_cfg")
-        cfr = clientes_fisc[clientes_fisc["nombre"] == cf].iloc[0]
-        f1, f2 = st.columns(2)
-        fcuit = f1.text_input("CUIT del cliente", value=str(cfr.get("cuit") or ""), key="fisc_cuit")
-        fdom = f2.text_input("Domicilio", value=str(cfr.get("domicilio") or ""), key="fisc_dom")
-        f3, f4 = st.columns(2)
-        current_cond = int(cfr.get("condicion_iva_receptor_id")) if pd.notna(cfr.get("condicion_iva_receptor_id")) else 0
-        fidiva = f3.number_input("ID condición IVA receptor (ARCA)", min_value=0, value=current_cond, step=1, key="fisc_idiva")
-        fdesc = f4.text_input("Descripción condición IVA", value=str(cfr.get("condicion_iva_receptor_desc") or ""), key="fisc_desciva")
-        if st.button("Guardar datos fiscales del cliente", key="fisc_save"):
-            execute("UPDATE clientes SET cuit=?,domicilio=?,condicion_iva_receptor_id=?,condicion_iva_receptor_desc=? WHERE id=?",
-                    (fcuit.strip() or None, fdom.strip() or None, int(fidiva) if fidiva else None, fdesc.strip() or None, int(cfr["id"])))
-            st.success("Datos fiscales guardados.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Email de facturación")
-    st.caption("El correo sale automáticamente desde sysgroupmdp@gmail.com cuando ARCA autoriza la factura y ya existe el PDF final.")
-    clientes_mail = get_clientes(True)
-    if len(clientes_mail):
-        cm = st.selectbox("Cliente para configurar email", clientes_mail["nombre"].tolist(), key="mail_cliente_cfg")
-        cr = clientes_mail[clientes_mail["nombre"] == cm].iloc[0]
-        email_actual = str(cr.get("email_facturacion") or "")
-        auto_actual = bool(int(cr.get("envio_automatico_factura") or 0))
-        mail_dest = st.text_input("Email de facturación del cliente", value=email_actual, key="mail_dest_cfg")
-        mail_auto = st.checkbox("Envío automático al autorizar", value=auto_actual, key="mail_auto_cfg")
-        if st.button("Guardar configuración de email", key="mail_cfg_save"):
-            execute("UPDATE clientes SET email_facturacion=?, envio_automatico_factura=? WHERE id=?",
-                    (mail_dest.strip() or None, 1 if mail_auto else 0, int(cr["id"])))
-            st.success("Configuración de email guardada.")
             st.rerun()
 
 with tabs[7]:
