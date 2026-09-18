@@ -338,6 +338,8 @@ def init_db():
     cols_comp = [r["name"] for r in conn.execute("PRAGMA table_info(comprobantes_arca)").fetchall()]
     if "pdf_path" not in cols_comp:
         conn.execute("ALTER TABLE comprobantes_arca ADD COLUMN pdf_path TEXT")
+    if "pdf_archivo_id" not in cols_comp:
+        conn.execute("ALTER TABLE comprobantes_arca ADD COLUMN pdf_archivo_id INTEGER")
     if "email_enviado" not in cols_comp:
         conn.execute("ALTER TABLE comprobantes_arca ADD COLUMN email_enviado INTEGER DEFAULT 0")
     if "email_enviado_a" not in cols_comp:
@@ -346,6 +348,20 @@ def init_db():
         conn.execute("ALTER TABLE comprobantes_arca ADD COLUMN email_enviado_en TEXT")
     if "email_error" not in cols_comp:
         conn.execute("ALTER TABLE comprobantes_arca ADD COLUMN email_error TEXT")
+
+    cols_mov = [r["name"] for r in conn.execute("PRAGMA table_info(movimientos)").fetchall()]
+    if "pdf_archivo_id" not in cols_mov:
+        conn.execute("ALTER TABLE movimientos ADD COLUMN pdf_archivo_id INTEGER")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS archivos_pdf(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT NOT NULL,
+            contenido BLOB NOT NULL,
+            mime_type TEXT DEFAULT 'application/pdf',
+            creado_en TEXT NOT NULL
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS email_log(
