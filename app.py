@@ -126,6 +126,11 @@ class PostgresCompatConnection:
         cur = self.cursor()
         return cur.execute(sql, params)
 
+    def executemany(self, sql, params_seq):
+        cur = self._connection.cursor()
+        cur.executemany(_pg_sql(sql), params_seq)
+        return PostgresCompatCursor(cur)
+
     def executescript(self, script):
         self._connection.execute(script)
 
@@ -1672,7 +1677,8 @@ def emisor_label(row):
 
 def ensure_invoice_items():
     conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) FROM items_facturacion").fetchone()[0]
+    count_row = conn.execute("SELECT COUNT(*) AS n FROM items_facturacion").fetchone()
+    n = count_row["n"] if isinstance(count_row, dict) else count_row[0]
     if n == 0:
         conn.executemany(
             "INSERT INTO items_facturacion(nombre,descripcion,precio_sugerido,activo) VALUES(?,?,?,1)",
