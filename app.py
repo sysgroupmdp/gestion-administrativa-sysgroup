@@ -1,6 +1,14 @@
 
 import streamlit as st
 import sqlite3
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    from psycopg import IntegrityError as PostgresIntegrityError
+except ImportError:
+    psycopg = None
+    dict_row = None
+    PostgresIntegrityError = sqlite3.IntegrityError
 from pathlib import Path
 from datetime import date, datetime
 import pandas as pd
@@ -58,6 +66,12 @@ if not acceso_autorizado():
     st.stop()
 
 def get_conn():
+    database_url = _secret("database_url") or _secret("DATABASE_URL")
+    if database_url:
+        if psycopg is None:
+            st.error("Falta instalar psycopg para conectar con Supabase.")
+            st.stop()
+        return PostgresCompatConnection(psycopg.connect(database_url, row_factory=dict_row))
     conn = sqlite3.connect(
         DB_PATH,
         check_same_thread=False,
@@ -68,9 +82,157 @@ def get_conn():
     conn.execute("PRAGMA busy_timeout = 30000;")
     return conn
 
+
+def _pg_sql(sql):
+    """Convierte los marcadores SQLite usados por la app al formato de PostgreSQL."""
+    return sql.replace("?", "%s")
+
+
+class PostgresCompatCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+
+    def execute(self, sql, params=()):
+        statement = _pg_sql(sql)
+        self._cursor.execute(statement, params)
+        if "RETURNING" in statement.upper():
+            row = self._cursor.fetchone()
+            if row:
+                self.lastrowid = row.get("id") if isinstance(row, dict) else row[0]
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+
+class PostgresCompatConnection:
+    """Capa mínima para mantener el SQL existente mientras los datos viven en Supabase."""
+    is_postgres = True
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def cursor(self):
+        return PostgresCompatCursor(self._connection.cursor())
+
+    def execute(self, sql, params=()):
+        cur = self.cursor()
+        return cur.execute(sql, params)
+
+    def executescript(self, script):
+        self._connection.execute(script)
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def close(self):
+        self._connection.close()
+
+
+DBIntegrityError = (sqlite3.IntegrityError, PostgresIntegrityError)
+
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
+    if getattr(conn, "is_postgres", False):
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS emisores(
+            id BIGSERIAL PRIMARY KEY, nombre TEXT NOT NULL, cuit TEXT NOT NULL UNIQUE,
+            condicion_iva TEXT, punto_venta INTEGER DEFAULT 1, activo INTEGER DEFAULT 1,
+            observaciones TEXT
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS items_facturacion(
+            id BIGSERIAL PRIMARY KEY, nombre TEXT NOT NULL, descripcion TEXT NOT NULL,
+            precio_sugerido NUMERIC DEFAULT 0, activo INTEGER DEFAULT 1
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS comprobantes_arca(
+            id BIGSERIAL PRIMARY KEY, cliente_id BIGINT NOT NULL REFERENCES clientes(id),
+            fecha_emision DATE NOT NULL, periodo_desde DATE, periodo_hasta DATE,
+            periodo_texto TEXT, tipo_periodo TEXT, tipo_comprobante TEXT DEFAULT 'C',
+            punto_venta INTEGER DEFAULT 1, numero_comprobante INTEGER, cae TEXT,
+            vencimiento_cae DATE, estado_arca TEXT DEFAULT 'BORRADOR', total NUMERIC NOT NULL DEFAULT 0,
+            observaciones TEXT, creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS comprobante_items(
+            id BIGSERIAL PRIMARY KEY, comprobante_id BIGINT NOT NULL REFERENCES comprobantes_arca(id),
+            item_catalogo_id BIGINT, descripcion TEXT NOT NULL, cantidad NUMERIC DEFAULT 1,
+            precio_unitario NUMERIC DEFAULT 0, subtotal NUMERIC DEFAULT 0
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS email_log(
+            id BIGSERIAL PRIMARY KEY, comprobante_id BIGINT, cliente_id BIGINT NOT NULL,
+            destinatario TEXT NOT NULL, asunto TEXT NOT NULL, estado TEXT NOT NULL,
+            detalle TEXT, fecha_hora TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("CREATE TABLE IF NOT EXISTS app_meta(clave TEXT PRIMARY KEY, valor TEXT)")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS archivos_pdf(
+            id BIGSERIAL PRIMARY KEY, nombre TEXT NOT NULL, contenido BYTEA NOT NULL,
+            mime_type TEXT DEFAULT 'application/pdf', creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+
+        # La primera versión del esquema usaba booleanos; la app histórica trabaja con 0/1.
+        for table, column in (("clientes", "activo"),):
+            cur.execute(f"""
+                DO $$ BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='{table}'
+                          AND column_name='{column}' AND data_type='boolean'
+                    ) THEN
+                        ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT;
+                        ALTER TABLE {table} ALTER COLUMN {column} TYPE INTEGER
+                        USING CASE WHEN {column} THEN 1 ELSE 0 END;
+                        ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT 1;
+                    END IF;
+                END $$
+            """)
+
+        def add_pg_col(table, name, definition):
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}")
+
+        for name, definition in (
+            ("emisor_predeterminado_id", "BIGINT"), ("email_facturacion", "TEXT"),
+            ("envio_automatico_factura", "INTEGER DEFAULT 1"), ("tipo_cliente", "TEXT DEFAULT 'Mensual'"),
+            ("domicilio", "TEXT"), ("condicion_iva_receptor_id", "INTEGER"),
+            ("condicion_iva_receptor_desc", "TEXT")
+        ):
+            add_pg_col("clientes", name, definition)
+        for name, definition in (
+            ("emisor_id", "BIGINT"), ("pdf_path", "TEXT"), ("pdf_archivo_id", "BIGINT"),
+            ("email_enviado", "INTEGER DEFAULT 0"), ("email_enviado_a", "TEXT"),
+            ("email_enviado_en", "TIMESTAMPTZ"), ("email_error", "TEXT"),
+            ("cbte_tipo_codigo", "INTEGER"), ("imp_neto", "NUMERIC"), ("imp_iva", "NUMERIC"),
+            ("fecha_vto_pago", "DATE"), ("arca_observaciones", "TEXT"), ("arca_error", "TEXT")
+        ):
+            add_pg_col("comprobantes_arca", name, definition)
+        add_pg_col("movimientos", "pdf_archivo_id", "BIGINT")
+        for name, definition in (
+            ("domicilio_fiscal", "TEXT"), ("ingresos_brutos", "TEXT"),
+            ("inicio_actividades", "DATE"), ("regimen_iva", "TEXT"),
+            ("iva_alicuota", "NUMERIC DEFAULT 21"),
+            ("ambiente_arca", "TEXT DEFAULT 'HOMOLOGACION'"),
+            ("precios_incluyen_iva", "INTEGER DEFAULT 1")
+        ):
+            add_pg_col("emisores", name, definition)
+        cur.execute("UPDATE clientes SET tipo_cliente='Mensual' WHERE tipo_cliente IS NULL OR TRIM(tipo_cliente)='' ")
+        conn.commit()
+        conn.close()
+        return
+
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS emisores(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,18 +399,50 @@ def init_db():
 
 def query_df(sql, params=()):
     conn = get_conn()
-    df = pd.read_sql_query(sql, conn, params=params)
+    if getattr(conn, "is_postgres", False):
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        df = pd.DataFrame(rows)
+    else:
+        df = pd.read_sql_query(sql, conn, params=params)
     conn.close()
     return df
 
 def execute(sql, params=()):
     conn = get_conn()
     cur = conn.cursor()
+    if getattr(conn, "is_postgres", False) and re.match(r"^\s*INSERT\b", sql, re.I) and "RETURNING" not in sql.upper():
+        sql = sql.rstrip().rstrip(";") + " RETURNING id"
     cur.execute(sql, params)
     conn.commit()
     rid = cur.lastrowid
     conn.close()
     return rid
+
+
+def guardar_pdf_permanente(nombre, contenido):
+    """Guarda un PDF dentro de PostgreSQL/Supabase y devuelve su identificador."""
+    if not contenido:
+        return None
+    if not (_secret("database_url") or _secret("DATABASE_URL")):
+        return None
+    return execute(
+        "INSERT INTO archivos_pdf(nombre,contenido,mime_type,creado_en) VALUES(?,?,?,?)",
+        (nombre, bytes(contenido), "application/pdf", datetime.now().isoformat())
+    )
+
+
+def leer_pdf_permanente(pdf_archivo_id=None, pdf_path=None):
+    if pdf_archivo_id and not pd.isna(pdf_archivo_id):
+        conn = get_conn()
+        row = conn.execute("SELECT nombre,contenido FROM archivos_pdf WHERE id=?", (int(pdf_archivo_id),)).fetchone()
+        conn.close()
+        if row:
+            return bytes(row["contenido"]), str(row["nombre"])
+    path = str(pdf_path or "").strip()
+    if path and Path(path).exists():
+        return Path(path).read_bytes(), Path(path).name
+    return None, None
 
 def money(v):
     try:
@@ -1348,12 +1542,34 @@ INITIAL_MOVEMENTS = [{'fecha': '2026-09-01',
 SEED_VERSION = "2026-09-10-restaurar-base-14217700-v2"
 
 def ensure_initial_data():
-    """Restaura una sola vez la base administrativa de Control de cuentas(1).xlsx (saldo fuente $ 14.217.700)."""
+    """Carga la base inicial únicamente cuando la base está realmente vacía.
+
+    Nunca elimina clientes, honorarios, movimientos ni comprobantes existentes.
+    """
     conn = get_conn()
     conn.execute("CREATE TABLE IF NOT EXISTS app_meta(clave TEXT PRIMARY KEY, valor TEXT)")
     row = conn.execute("SELECT valor FROM app_meta WHERE clave='seed_version'").fetchone()
     current_version = row["valor"] if row else None
     if current_version == SEED_VERSION:
+        conn.close()
+        return
+
+    existentes = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM clientes) clientes, "
+        "(SELECT COUNT(*) FROM movimientos) movimientos"
+    ).fetchone()
+    if existentes and (int(existentes["clientes"]) > 0 or int(existentes["movimientos"]) > 0):
+        conn.execute(
+            "INSERT INTO app_meta(clave,valor) VALUES('seed_version',?) "
+            "ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor",
+            (SEED_VERSION,)
+        )
+        conn.execute(
+            "INSERT INTO app_meta(clave,valor) VALUES('seed_warning',?) "
+            "ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor",
+            ("Se preservaron los datos existentes; no se aplicó la carga inicial.",)
+        )
+        conn.commit()
         conn.close()
         return
 
@@ -1370,14 +1586,6 @@ def ensure_initial_data():
         conn.commit()
         conn.close()
         return
-
-    # En esta etapa todavía no hay comprobantes fiscales válidos: limpiamos borradores
-    # y reemplazamos solamente la base administrativa por el último Excel.
-    conn.execute("DELETE FROM comprobante_items")
-    conn.execute("DELETE FROM comprobantes_arca")
-    conn.execute("DELETE FROM movimientos")
-    conn.execute("DELETE FROM honorarios")
-    conn.execute("DELETE FROM clientes")
 
     for c in INITIAL_CLIENTS:
         conn.execute("""
@@ -1499,6 +1707,7 @@ def guardar_borrador_arca(cliente_id, emisor_id, fecha_emision, p_desde, p_hasta
             cliente_id,emisor_id,fecha_emision,periodo_desde,periodo_hasta,periodo_texto,
             tipo_periodo,tipo_comprobante,total,observaciones,creado_en
         ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        RETURNING id
     """, (
         cliente_id, emisor_id, fecha_emision.isoformat(),
         p_desde.isoformat() if p_desde else None,
@@ -1553,8 +1762,8 @@ def enviar_factura_por_email(comprobante_id, destinatario=None):
         return False, "El cliente no tiene email de facturación configurado."
     if str(r.get("estado_arca") or "").upper() != "AUTORIZADA":
         return False, "La factura todavía no está autorizada por ARCA."
-    pdf_path = str(r.get("pdf_path") or "").strip()
-    if not pdf_path or not Path(pdf_path).exists():
+    pdf_bytes, pdf_name = leer_pdf_permanente(r.get("pdf_archivo_id"), r.get("pdf_path"))
+    if not pdf_bytes:
         return False, "La factura autorizada todavía no tiene un PDF disponible."
     if not gmail_configurada():
         return False, "Falta configurar la credencial privada de Gmail en los secretos de la app."
@@ -1566,8 +1775,7 @@ def enviar_factura_por_email(comprobante_id, destinatario=None):
         msg["To"] = destino
         msg["Subject"] = MAIL_SUBJECT
         msg.set_content(MAIL_BODY)
-        pdf_bytes = Path(pdf_path).read_bytes()
-        msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=Path(pdf_path).name)
+        msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_name or "factura.pdf")
 
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as smtp:
@@ -1594,8 +1802,13 @@ def registrar_factura_autorizada(comprobante_id, pdf_path=None):
     if len(row) != 1:
         return False, "Comprobante inexistente."
     r = row.iloc[0]
+    pdf_archivo_id = None
     if pdf_path:
-        execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA', pdf_path=? WHERE id=?", (str(pdf_path), comprobante_id))
+        p = Path(pdf_path)
+        if p.exists():
+            pdf_archivo_id = guardar_pdf_permanente(p.name, p.read_bytes())
+        execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA', pdf_path=?, pdf_archivo_id=? WHERE id=?",
+                (str(pdf_path), pdf_archivo_id, comprobante_id))
     else:
         execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA' WHERE id=?", (comprobante_id,))
 
@@ -1605,12 +1818,13 @@ def registrar_factura_autorizada(comprobante_id, pdf_path=None):
     comp_ref = f"ARCA-{t}-{int(pv or 0):05d}-{int(nro or comprobante_id):08d}"
     try:
         execute("""INSERT INTO movimientos
-        (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
-        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,pdf_archivo_id,estado_conciliacion,creado_en)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (r["fecha_emision"], int(r["cliente_id"]), "Factura/Cargo", "Factura autorizada ARCA", float(r["total"]),
-         r["periodo_desde"] or r["fecha_emision"][:7] + "-01", comp_ref, str(pdf_path) if pdf_path else None,
+         r["periodo_desde"] or pd.to_datetime(r["fecha_emision"]).date().replace(day=1).isoformat(), comp_ref,
+         str(pdf_path) if pdf_path else None, pdf_archivo_id,
          "Pendiente", datetime.now().isoformat()))
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         pass
 
     if not pdf_path:
@@ -1959,7 +2173,7 @@ def generate_monthly_notices(period=None, cliente_id=None, importe_override=None
             (fecha, int(r["id"]), "Aviso de pago", f"Honorarios {period.strftime('%m/%Y')}",
              importe, periodo, comprobante, None, None, datetime.now().isoformat()))
             generated += 1
-        except sqlite3.IntegrityError:
+        except DBIntegrityError:
             duplicates += 1
     return generated, duplicates
 
@@ -2232,17 +2446,19 @@ with tabs[2]:
                     continue
                 safe_name = datetime.now().strftime("%Y%m%d%H%M%S_%f_") + re.sub(r"[^A-Za-z0-9_.-]", "_", row["archivo"])
                 p = PDF_DIR / safe_name
-                p.write_bytes(file_map[row["archivo"]])
+                pdf_bytes = file_map[row["archivo"]]
+                p.write_bytes(pdf_bytes)
+                pdf_archivo_id = guardar_pdf_permanente(safe_name, pdf_bytes)
                 periodo_fact = date(row["fecha"].year, row["fecha"].month, 1).isoformat()
                 try:
                     execute("""INSERT INTO movimientos
-                    (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,pdf_archivo_id,estado_conciliacion,creado_en)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (row["fecha"].isoformat(), row["cliente_id"], "Factura/Cargo", "Factura externa / ARCA",
-                     float(row["importe"]), periodo_fact, row["comprobante"] or row["archivo"], str(p),
+                     float(row["importe"]), periodo_fact, row["comprobante"] or row["archivo"], str(p), pdf_archivo_id,
                      "Importada", datetime.now().isoformat()))
                     ok += 1
-                except sqlite3.IntegrityError:
+                except DBIntegrityError:
                     errs.append(row["archivo"])
             st.success(f"Facturas cargadas: {ok}")
             if errs:
@@ -2306,18 +2522,22 @@ with tabs[2]:
                              nuevo_email.strip() or None, int(cond_id) if cond_id else None, nueva_cond or None))
 
                     pdf_path = None
+                    pdf_archivo_id = None
                     if archivo:
                         safe_name = datetime.now().strftime("%Y%m%d%H%M%S_%f_") + re.sub(r"[^A-Za-z0-9_.-]", "_", archivo.name)
                         p = PDF_DIR / safe_name
-                        p.write_bytes(archivo.getvalue())
+                        pdf_bytes = archivo.getvalue()
+                        p.write_bytes(pdf_bytes)
                         pdf_path = str(p)
+                        pdf_archivo_id = guardar_pdf_permanente(safe_name, pdf_bytes)
                     execute("""INSERT INTO movimientos
-                    (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,pdf_archivo_id,estado_conciliacion,creado_en)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (fecha.isoformat(), cid, "Factura/Cargo", f"Factura · Origen: {origen}", float(importe),
-                     fecha.replace(day=1).isoformat(), comp.strip() or None, pdf_path, "Carga manual", datetime.now().isoformat()))
+                     fecha.replace(day=1).isoformat(), comp.strip() or None, pdf_path, pdf_archivo_id,
+                     "Carga manual", datetime.now().isoformat()))
                     st.success("Factura cargada correctamente. El cliente también quedó incorporado al control." if modo_fm == "Nuevo cliente ocasional" else "Factura cargada correctamente.")
-                except sqlite3.IntegrityError:
+                except DBIntegrityError:
                     st.error("Esa factura ya parece estar cargada para este cliente y período, o el nombre del cliente ya existe. Revisá los datos.")
                 except Exception as e:
                     st.error(f"No se pudo guardar: {e}")
@@ -2620,9 +2840,10 @@ with tabs[8]:
     st.divider()
     st.markdown("#### Revisar movimientos duplicados")
     st.caption("No se borra nada automáticamente. Acá podés detectar registros exactamente repetidos y decidir cuál eliminar.")
-    duplicados = query_df("""
+    agregador_ids = "STRING_AGG(CAST(m.id AS TEXT), ',')" if (_secret("database_url") or _secret("DATABASE_URL")) else "GROUP_CONCAT(m.id)"
+    duplicados = query_df(f"""
         SELECT c.nombre cliente,m.fecha,m.tipo,m.descripcion,m.importe,m.periodo,m.comprobante,
-               COUNT(*) cantidad, GROUP_CONCAT(m.id) ids
+               COUNT(*) cantidad, {agregador_ids} ids
         FROM movimientos m JOIN clientes c ON c.id=m.cliente_id
         GROUP BY m.cliente_id,m.fecha,m.tipo,COALESCE(m.descripcion,''),m.importe,COALESCE(m.periodo,''),COALESCE(m.comprobante,'')
         HAVING COUNT(*) > 1
@@ -2676,7 +2897,9 @@ with tabs[9]:
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.divider()
     st.subheader("Respaldo completo")
-    if DB_PATH.exists():
+    if _secret("database_url") or _secret("DATABASE_URL"):
+        st.success("Base permanente activa en Supabase/PostgreSQL. El Excel incluye los datos administrativos principales.")
+    elif DB_PATH.exists():
         st.download_button(
             "Descargar base de datos",
             data=DB_PATH.read_bytes(),
@@ -2807,7 +3030,8 @@ with tabs[10]:
         st.warning("Falta configurar la credencial privada de Gmail. La factura puede emitirse en ARCA, pero no se enviará automáticamente hasta hacerlo.")
 
     autorizadas = query_df("""
-        SELECT a.id,c.nombre cliente,c.email_facturacion,a.pdf_path,a.email_enviado,a.email_enviado_a,a.email_enviado_en
+        SELECT a.id,c.nombre cliente,c.email_facturacion,a.pdf_path,a.pdf_archivo_id,
+               a.email_enviado,a.email_enviado_a,a.email_enviado_en
         FROM comprobantes_arca a JOIN clientes c ON c.id=a.cliente_id
         WHERE a.estado_arca='AUTORIZADA'
         ORDER BY a.id DESC
@@ -2817,9 +3041,9 @@ with tabs[10]:
         rr = autorizadas[autorizadas["id"] == sel_id].iloc[0]
         st.caption(f"Cliente: {rr['cliente']} · Email: {rr.get('email_facturacion') or 'sin configurar'}")
         cdl, csend = st.columns(2)
-        p = str(rr.get("pdf_path") or "")
-        if p and Path(p).exists():
-            cdl.download_button("Descargar PDF", data=Path(p).read_bytes(), file_name=Path(p).name, mime="application/pdf", key=f"pdf_{sel_id}")
+        pdf_bytes, pdf_name = leer_pdf_permanente(rr.get("pdf_archivo_id"), rr.get("pdf_path"))
+        if pdf_bytes:
+            cdl.download_button("Descargar PDF", data=pdf_bytes, file_name=pdf_name or f"factura_{sel_id}.pdf", mime="application/pdf", key=f"pdf_{sel_id}")
         else:
             cdl.info("PDF todavía no disponible")
         if csend.button("Enviar / reenviar factura", key=f"send_{sel_id}"):
@@ -2828,4 +3052,3 @@ with tabs[10]:
 
     st.divider()
     st.info("Secuencia fiscal implementada: WSAA → último comprobante → FECAESolicitar → CAE → PDF con QR → cuenta corriente → email. Para PRODUCCIÓN se requiere completar la habilitación/certificados de cada CUIT en ARCA.")
-
