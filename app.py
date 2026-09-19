@@ -2654,19 +2654,82 @@ with tabs[5]:
     st.subheader("Trabajo extra / puntual")
     clientes=get_clientes(True)
     with st.form("extra"):
-        nom=st.selectbox("Cliente",clientes["nombre"].tolist(),key="ex_cli")
+        modo_cliente_extra=st.radio(
+            "Cliente",
+            ["Cliente existente", "Nuevo cliente ocasional"],
+            horizontal=True,
+            key="ex_modo_cliente"
+        )
+        nom=None
+        nuevo_nombre_extra=""
+        nuevo_documento_extra=""
+        nuevo_email_extra=""
+        if modo_cliente_extra == "Cliente existente":
+            if len(clientes):
+                nom=st.selectbox("Cliente existente",clientes["nombre"].tolist(),key="ex_cli")
+            else:
+                st.info("Todavía no hay clientes guardados. Elegí Nuevo cliente ocasional.")
+        else:
+            nuevo_nombre_extra=st.text_input("Nombre / Razón social",key="ex_nuevo_nombre")
+            e1,e2=st.columns(2)
+            nuevo_documento_extra=e1.text_input("CUIT o DNI (opcional)",key="ex_nuevo_documento")
+            nuevo_email_extra=e2.text_input("Email (opcional)",key="ex_nuevo_email")
+            st.caption("Se guardará como cliente ocasional y quedará disponible para futuros trabajos o facturas.")
         fecha=st.date_input("Fecha",value=date.today(),key="ex_fecha")
         concepto=st.text_input("Concepto",placeholder="Ej.: Medición de ruido extraordinaria")
         imp=st.number_input("Importe",min_value=0.0,step=1000.0,key="ex_imp")
         comp=st.text_input("Comprobante / referencia opcional",key="ex_comp")
         if st.form_submit_button("Guardar trabajo"):
-            cid=int(clientes.loc[clientes["nombre"]==nom,"id"].iloc[0])
-            execute("""INSERT INTO movimientos
-            (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (fecha.isoformat(),cid,"Ajuste",concepto or "Trabajo puntual",imp,fecha.replace(day=1).isoformat(),
-             comp or None,None,None,datetime.now().isoformat()))
-            st.success("Trabajo puntual registrado.")
+            error_extra=None
+            cliente_creado=False
+            cid=None
+            if modo_cliente_extra == "Cliente existente":
+                if not len(clientes) or not nom:
+                    error_extra="Seleccioná un cliente o cargá uno nuevo como ocasional."
+                else:
+                    cid=int(clientes.loc[clientes["nombre"]==nom,"id"].iloc[0])
+            else:
+                nombre_limpio=nuevo_nombre_extra.strip()
+                documento_limpio=nuevo_documento_extra.strip()
+                email_limpio=nuevo_email_extra.strip()
+                if not nombre_limpio:
+                    error_extra="Ingresá el nombre o razón social del cliente ocasional."
+                elif email_limpio and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_limpio):
+                    error_extra="Revisá el email: no parece válido."
+                else:
+                    existente=pd.DataFrame()
+                    if documento_limpio:
+                        existente=query_df("""SELECT id FROM clientes
+                            WHERE REPLACE(REPLACE(REPLACE(COALESCE(cuit,''),'-',''),' ',''),'.','')=?
+                            LIMIT 1""",(digits(documento_limpio),))
+                    if not len(existente):
+                        existente=query_df("SELECT id FROM clientes WHERE UPPER(nombre)=UPPER(?) LIMIT 1",(nombre_limpio,))
+                    if len(existente):
+                        cid=int(existente.iloc[0]["id"])
+                        execute("""UPDATE clientes SET activo=1,
+                                   cuit=COALESCE(NULLIF(?,''),cuit),
+                                   email_facturacion=COALESCE(NULLIF(?,''),email_facturacion)
+                                   WHERE id=?""",(documento_limpio,email_limpio,cid))
+                    else:
+                        cid=execute("""INSERT INTO clientes(
+                            nombre,cuit,modalidad,tipo_cliente,honorario,vigente_desde,dia_generacion,
+                            activo,observaciones,email_facturacion,envio_automatico_factura
+                        ) VALUES(?,?,'Factura','Ocasional',0,?,1,1,?,?,0)""",
+                        (nombre_limpio,documento_limpio or None,fecha.replace(day=1).isoformat(),
+                         'Cliente ocasional creado desde Trabajos extras',email_limpio or None))
+                        cliente_creado=True
+            if error_extra:
+                st.error(error_extra)
+            else:
+                execute("""INSERT INTO movimientos
+                (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (fecha.isoformat(),cid,"Ajuste",concepto or "Trabajo puntual",imp,fecha.replace(day=1).isoformat(),
+                 comp or None,None,None,datetime.now().isoformat()))
+                if cliente_creado:
+                    st.success("Trabajo puntual registrado. El cliente ocasional quedó guardado en Clientes.")
+                else:
+                    st.success("Trabajo puntual registrado.")
 
 with tabs[6]:
     st.subheader("Clientes")
@@ -2863,13 +2926,25 @@ with tabs[8]:
     st.markdown("#### Revisar movimientos duplicados")
     st.caption("No se borra nada automáticamente. Acá podés detectar registros exactamente repetidos y decidir cuál eliminar.")
     agregador_ids = "STRING_AGG(CAST(m.id AS TEXT), ',')" if (_secret("database_url") or _secret("DATABASE_URL")) else "GROUP_CONCAT(m.id)"
+    # Se normalizan fechas y referencias a texto antes de agrupar. En algunas
+    # bases PostgreSQL/Supabase estos campos son DATE; aplicar COALESCE con ''
+    # directamente hace que PostgreSQL intente interpretar el vacío como fecha.
     duplicados = query_df(f"""
-        SELECT c.nombre cliente,m.fecha,m.tipo,m.descripcion,m.importe,m.periodo,m.comprobante,
-               COUNT(*) cantidad, {agregador_ids} ids
+        SELECT c.nombre cliente,
+               CAST(m.fecha AS TEXT) fecha,
+               m.tipo,
+               COALESCE(CAST(m.descripcion AS TEXT),'') descripcion,
+               m.importe,
+               CAST(m.periodo AS TEXT) periodo,
+               COALESCE(CAST(m.comprobante AS TEXT),'') comprobante,
+               COUNT(*) cantidad,
+               {agregador_ids} ids
         FROM movimientos m JOIN clientes c ON c.id=m.cliente_id
-        GROUP BY m.cliente_id,m.fecha,m.tipo,COALESCE(m.descripcion,''),m.importe,COALESCE(m.periodo,''),COALESCE(m.comprobante,'')
+        GROUP BY c.nombre,m.cliente_id,CAST(m.fecha AS TEXT),m.tipo,
+                 COALESCE(CAST(m.descripcion AS TEXT),''),m.importe,
+                 CAST(m.periodo AS TEXT),COALESCE(CAST(m.comprobante AS TEXT),'')
         HAVING COUNT(*) > 1
-        ORDER BY cantidad DESC,c.nombre,m.fecha
+        ORDER BY cantidad DESC,c.nombre,CAST(m.fecha AS TEXT)
     """)
     if len(duplicados):
         dup_vista = duplicados.copy()
