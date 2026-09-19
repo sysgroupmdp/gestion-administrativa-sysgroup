@@ -2266,6 +2266,9 @@ ensure_invoice_items()
 
 st.title("S&S Group · Gestión Administrativa")
 st.caption("Clientes · Facturación · Cuenta corriente · Pagos · Avisos · Trabajos puntuales · ARCA")
+mensaje_pago_guardado=st.session_state.pop("pago_guardado_msg",None)
+if mensaje_pago_guardado:
+    st.toast(mensaje_pago_guardado,icon="✅")
 
 # Los avisos mensuales no se generan al abrir la app.
 # Se generan desde la pestaña "Avisos de pago" para evitar cargos accidentales.
@@ -2643,12 +2646,19 @@ with tabs[4]:
         imp=st.number_input("Importe recibido",min_value=0.0,step=1000.0,key="pg_imp")
         desc=st.text_input("Descripción / referencia",value="Pago recibido")
         if st.form_submit_button("Registrar pago",type="primary"):
-            cid=int(clientes.loc[clientes["nombre"]==nom,"id"].iloc[0])
-            execute("""INSERT INTO movimientos
-            (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (fecha.isoformat(),cid,"Pago",desc,-abs(imp),fecha.replace(day=1).isoformat(),None,None,"Registrado",datetime.now().isoformat()))
-            st.success("Pago registrado.")
+            if imp <= 0:
+                st.error("Ingresá un importe de pago mayor a $0.")
+            else:
+                cid=int(clientes.loc[clientes["nombre"]==nom,"id"].iloc[0])
+                execute("""INSERT INTO movimientos
+                (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,estado_conciliacion,creado_en)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (fecha.isoformat(),cid,"Pago",desc,-abs(imp),fecha.replace(day=1).isoformat(),None,None,"Registrado",datetime.now().isoformat()))
+                # El Panel se dibuja antes que esta pestaña. Forzamos una nueva
+                # ejecución para que vuelva a consultar la base y muestre el
+                # saldo descontado inmediatamente.
+                st.session_state["pago_guardado_msg"]=f"Pago de {money(imp)} registrado para {nom}. Saldo actualizado."
+                st.rerun()
 
 with tabs[5]:
     st.subheader("Trabajo extra / puntual")
@@ -3005,8 +3015,16 @@ with tabs[8]:
 
 with tabs[9]:
     st.subheader("Exportar a Excel")
-    st.write("Genera una copia completa de clientes, movimientos, saldos y honorarios.")
-    if st.button("Preparar Excel"):
+    tipo_exportacion=st.radio(
+        "¿Qué querés exportar?",
+        ["Gestión completa", "Cuenta corriente de un cliente"],
+        horizontal=True,
+        key="exp_tipo"
+    )
+
+    if tipo_exportacion == "Gestión completa":
+        st.write("Genera una copia completa de clientes, movimientos, saldos y honorarios.")
+    if tipo_exportacion == "Gestión completa" and st.button("Preparar Excel completo",key="exp_completo"):
         clientes=query_df("SELECT * FROM clientes ORDER BY nombre")
         movimientos=query_df("""
           SELECT m.*,c.nombre cliente FROM movimientos m JOIN clientes c ON c.id=m.cliente_id
@@ -3030,6 +3048,77 @@ with tabs[9]:
             email_log.to_excel(writer,index=False,sheet_name="Emails")
         st.download_button("Descargar Excel",data=out.getvalue(),file_name=f"Gestion_administrativa_{date.today().isoformat()}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    if tipo_exportacion == "Cuenta corriente de un cliente":
+        st.write("Genera un archivo individual con los movimientos y el saldo pendiente del cliente seleccionado.")
+        clientes_exportar=get_clientes(False)
+        if not len(clientes_exportar):
+            st.info("Todavía no hay clientes para exportar.")
+        else:
+            nombre_exportar=st.selectbox(
+                "Cliente",clientes_exportar["nombre"].tolist(),key="exp_cliente"
+            )
+            cliente_exportar=clientes_exportar.loc[
+                clientes_exportar["nombre"]==nombre_exportar
+            ].iloc[0]
+            cliente_id_exportar=int(cliente_exportar["id"])
+
+            movimientos_cliente=query_df("""
+                SELECT m.fecha,m.tipo,COALESCE(m.descripcion,'') descripcion,
+                       m.importe,COALESCE(CAST(m.comprobante AS TEXT),'') comprobante
+                FROM movimientos m
+                WHERE m.cliente_id=?
+                ORDER BY m.fecha,m.id
+            """,(cliente_id_exportar,))
+            saldo_cliente=float(movimientos_cliente["importe"].sum()) if len(movimientos_cliente) else 0.0
+
+            m1,m2=st.columns(2)
+            m1.metric("Movimientos",len(movimientos_cliente))
+            m2.metric("Saldo pendiente",money(saldo_cliente))
+
+            if st.button("Preparar cuenta corriente",key="exp_preparar_cliente"):
+                detalle=movimientos_cliente.copy()
+                if len(detalle):
+                    detalle["Cargo"] = detalle["importe"].apply(lambda x: float(x) if float(x)>0 else 0)
+                    detalle["Pago"] = detalle["importe"].apply(lambda x: abs(float(x)) if float(x)<0 else 0)
+                    detalle["Saldo acumulado"] = detalle["importe"].astype(float).cumsum()
+                    detalle=detalle.drop(columns=["importe"])
+                    detalle=detalle.rename(columns={
+                        "fecha":"Fecha","tipo":"Tipo","descripcion":"Descripción",
+                        "comprobante":"Comprobante"
+                    })
+                else:
+                    detalle=pd.DataFrame(columns=[
+                        "Fecha","Tipo","Descripción","Comprobante","Cargo","Pago","Saldo acumulado"
+                    ])
+
+                resumen=pd.DataFrame([{
+                    "Cliente":nombre_exportar,
+                    "CUIT":str(cliente_exportar.get("cuit") or ""),
+                    "Domicilio":str(cliente_exportar.get("domicilio") or ""),
+                    "Email":str(cliente_exportar.get("email_facturacion") or ""),
+                    "Fecha de emisión":date.today().strftime("%d/%m/%Y"),
+                    "Saldo pendiente":saldo_cliente
+                }])
+
+                out_cliente=io.BytesIO()
+                with pd.ExcelWriter(out_cliente,engine="openpyxl") as writer:
+                    resumen.to_excel(writer,index=False,sheet_name="Resumen")
+                    detalle.to_excel(writer,index=False,sheet_name="Cuenta corriente")
+                    for hoja in writer.book.worksheets:
+                        hoja.freeze_panes="A2"
+                        for columna in hoja.columns:
+                            ancho=max(len(str(celda.value or "")) for celda in columna)+2
+                            hoja.column_dimensions[columna[0].column_letter].width=min(max(ancho,12),45)
+
+                nombre_archivo=re.sub(r"[^A-Za-z0-9_-]+","_",nombre_exportar.strip()).strip("_") or "cliente"
+                st.download_button(
+                    "Descargar cuenta corriente del cliente",
+                    data=out_cliente.getvalue(),
+                    file_name=f"Cuenta_corriente_{nombre_archivo}_{date.today().isoformat()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="exp_descargar_cliente"
+                )
     st.divider()
     st.subheader("Respaldo completo")
     if _secret("database_url") or _secret("DATABASE_URL"):
