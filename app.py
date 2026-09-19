@@ -2653,27 +2653,58 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("Trabajo extra / puntual")
     clientes=get_clientes(True)
+    # Debe quedar fuera del formulario: los widgets dentro de st.form recién
+    # actualizan la pantalla al enviar, por eso antes seguía apareciendo el
+    # selector de clientes existentes aunque se marcara "Nuevo cliente".
+    modo_cliente_extra=st.radio(
+        "Cliente",
+        ["Cliente existente", "Nuevo cliente ocasional"],
+        horizontal=True,
+        key="ex_modo_cliente"
+    )
     with st.form("extra"):
-        modo_cliente_extra=st.radio(
-            "Cliente",
-            ["Cliente existente", "Nuevo cliente ocasional"],
-            horizontal=True,
-            key="ex_modo_cliente"
-        )
         nom=None
         nuevo_nombre_extra=""
         nuevo_documento_extra=""
         nuevo_email_extra=""
+        nuevo_domicilio_extra=""
+        nueva_cond_extra=""
+        nueva_modalidad_extra="Factura"
+        nuevo_honorario_extra=0.0
+        nueva_vigencia_extra=date.today().replace(day=1)
+        nuevo_envio_auto_extra=False
         if modo_cliente_extra == "Cliente existente":
             if len(clientes):
                 nom=st.selectbox("Cliente existente",clientes["nombre"].tolist(),key="ex_cli")
             else:
                 st.info("Todavía no hay clientes guardados. Elegí Nuevo cliente ocasional.")
         else:
+            st.markdown("#### Datos del nuevo cliente ocasional")
             nuevo_nombre_extra=st.text_input("Nombre / Razón social",key="ex_nuevo_nombre")
             e1,e2=st.columns(2)
-            nuevo_documento_extra=e1.text_input("CUIT o DNI (opcional)",key="ex_nuevo_documento")
-            nuevo_email_extra=e2.text_input("Email (opcional)",key="ex_nuevo_email")
+            nuevo_documento_extra=e1.text_input("CUIT",key="ex_nuevo_documento")
+            nuevo_domicilio_extra=e2.text_input("Domicilio fiscal / comercial",key="ex_nuevo_domicilio")
+            nueva_cond_extra=st.selectbox(
+                "Condición frente al IVA",
+                [""] + list(IVA_RECEPTOR_OPCIONES.keys()),
+                key="ex_nueva_condicion"
+            )
+            n1,n2=st.columns(2)
+            nuevo_email_extra=n1.text_input("Email de facturación",key="ex_nuevo_email")
+            nueva_modalidad_extra=n2.selectbox(
+                "Forma de cobro",["Factura","Aviso de pago"],key="ex_nueva_modalidad"
+            )
+            h1,h2=st.columns(2)
+            nuevo_honorario_extra=h1.number_input(
+                "Honorario vigente",min_value=0.0,step=1000.0,key="ex_nuevo_honorario",
+                help="Puede quedar en $0 si no tiene un honorario mensual."
+            )
+            nueva_vigencia_extra=h2.date_input(
+                "Vigente desde",value=date.today().replace(day=1),key="ex_nueva_vigencia"
+            )
+            nuevo_envio_auto_extra=st.checkbox(
+                "Enviar factura automáticamente por email",value=False,key="ex_nuevo_envio_auto"
+            )
             st.caption("Se guardará como cliente ocasional y quedará disponible para futuros trabajos o facturas.")
         fecha=st.date_input("Fecha",value=date.today(),key="ex_fecha")
         concepto=st.text_input("Concepto",placeholder="Ej.: Medición de ruido extraordinaria")
@@ -2692,6 +2723,8 @@ with tabs[5]:
                 nombre_limpio=nuevo_nombre_extra.strip()
                 documento_limpio=nuevo_documento_extra.strip()
                 email_limpio=nuevo_email_extra.strip()
+                domicilio_limpio=nuevo_domicilio_extra.strip()
+                cond_id_extra=IVA_RECEPTOR_OPCIONES.get(nueva_cond_extra)
                 if not nombre_limpio:
                     error_extra="Ingresá el nombre o razón social del cliente ocasional."
                 elif email_limpio and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_limpio):
@@ -2708,15 +2741,20 @@ with tabs[5]:
                         cid=int(existente.iloc[0]["id"])
                         execute("""UPDATE clientes SET activo=1,
                                    cuit=COALESCE(NULLIF(?,''),cuit),
-                                   email_facturacion=COALESCE(NULLIF(?,''),email_facturacion)
-                                   WHERE id=?""",(documento_limpio,email_limpio,cid))
+                                   email_facturacion=COALESCE(NULLIF(?,''),email_facturacion),
+                                   domicilio=COALESCE(NULLIF(?,''),domicilio)
+                                   WHERE id=?""",(documento_limpio,email_limpio,domicilio_limpio,cid))
                     else:
                         cid=execute("""INSERT INTO clientes(
                             nombre,cuit,modalidad,tipo_cliente,honorario,vigente_desde,dia_generacion,
-                            activo,observaciones,email_facturacion,envio_automatico_factura
-                        ) VALUES(?,?,'Factura','Ocasional',0,?,1,1,?,?,0)""",
-                        (nombre_limpio,documento_limpio or None,fecha.replace(day=1).isoformat(),
-                         'Cliente ocasional creado desde Trabajos extras',email_limpio or None))
+                            activo,observaciones,email_facturacion,envio_automatico_factura,
+                            domicilio,condicion_iva_receptor_id,condicion_iva_receptor_desc
+                        ) VALUES(?,?,?,'Ocasional',?,?,1,1,?,?,?,?,?,?)""",
+                        (nombre_limpio,documento_limpio or None,nueva_modalidad_extra,
+                         float(nuevo_honorario_extra),nueva_vigencia_extra.isoformat(),
+                         'Cliente ocasional creado desde Trabajos extras',email_limpio or None,
+                         1 if nuevo_envio_auto_extra else 0,domicilio_limpio or None,
+                         int(cond_id_extra) if cond_id_extra else None,nueva_cond_extra or None))
                         cliente_creado=True
             if error_extra:
                 st.error(error_extra)
