@@ -1668,6 +1668,38 @@ def ensure_emitters():
     conn.commit()
     conn.close()
 
+
+def apply_emitter_fiscal_details_20261001():
+    """Aplica una vez por CUIT los datos fiscales indicados por el titular."""
+    datos = [
+        ("27-41149423-9", "2025-09-01", "Termas De Rio Hondo Bis 3622 Piso:PB Dpto:PH 2 - Mar Del Plata."),
+        ("20-37769536-5", "2015-04-01", "Moises Lebensohn 3386, Mar del Plata"),
+        ("20-35140724-8", "2011-10-01", "Moises Lebensohn 3366, Mar del Plata"),
+    ]
+    conn = get_conn()
+    try:
+        for cuit, fecha, domicilio in datos:
+            clave = f"datos_fiscales_emisor_20261001_{cuit}"
+            if conn.execute("SELECT valor FROM app_meta WHERE clave=?", (clave,)).fetchone():
+                continue
+            emisor = conn.execute("SELECT id FROM emisores WHERE cuit=?", (cuit,)).fetchone()
+            if emisor is None:
+                raise RuntimeError(f"No se encontró el emisor {cuit} para configurar sus datos fiscales.")
+            conn.execute(
+                "UPDATE emisores SET domicilio_fiscal=?,inicio_actividades=? WHERE cuit=?",
+                (domicilio, fecha, cuit),
+            )
+            conn.execute(
+                "INSERT INTO app_meta(clave,valor) VALUES(?,?) ON CONFLICT(clave) DO NOTHING",
+                (clave, "aplicado"),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def get_emisores(active_only=True):
     where = "WHERE activo=1" if active_only else ""
     return query_df(f"SELECT * FROM emisores {where} ORDER BY nombre")
@@ -2262,6 +2294,7 @@ def crear_o_recuperar_cliente_ocasional(nombre, documento, condicion_desc, email
 init_db()
 ensure_initial_data()
 ensure_emitters()
+apply_emitter_fiscal_details_20261001()
 ensure_invoice_items()
 
 st.title("S&S Group · Gestión Administrativa")
@@ -3187,7 +3220,7 @@ with tabs[10]:
         ambiente = a2.selectbox("Ambiente", amb_opts, index=amb_opts.index(amb_current) if amb_current in amb_opts else 0, key="arca_amb")
 
         a3, a4 = st.columns(2)
-        domicilio_fiscal = a3.text_input("Domicilio fiscal", value=str(current.get("domicilio_fiscal") or ""), key="arca_dom")
+        domicilio_fiscal = a3.text_input("Domicilio fiscal", value=str(current.get("domicilio_fiscal") or ""), key=f"arca_dom_fiscal_{int(em_labels[ec])}")
         iibb = a4.text_input("Ingresos Brutos (opcional)", value=str(current.get("ingresos_brutos") or ""), key="arca_iibb")
         ini_txt = str(current.get("inicio_actividades") or "")
         try:
@@ -3197,7 +3230,7 @@ with tabs[10]:
         inicio_act_txt = st.text_input(
             "Inicio de actividades (DD/MM/AAAA)",
             value=ini_default.strftime("%d/%m/%Y"),
-            key=f"arca_ini_texto_{int(em_labels[ec])}",
+            key=f"arca_ini_configurado_{int(em_labels[ec])}",
             help="Escribí la fecha completa, por ejemplo 01/03/2010. Se permiten años desde 1900.",
         )
         inicio_act = None
