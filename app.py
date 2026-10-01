@@ -3194,11 +3194,23 @@ with tabs[10]:
             ini_default = datetime.strptime(ini_txt, "%Y-%m-%d").date() if ini_txt else date.today()
         except Exception:
             ini_default = date.today()
-        inicio_act = st.date_input("Inicio de actividades", value=ini_default,
-                                   min_value=date(1900, 1, 1), max_value=date(2100, 12, 31),
-                                   key=f"arca_ini_{int(em_labels[ec])}", format="DD/MM/YYYY")
+        inicio_act_txt = st.text_input(
+            "Inicio de actividades (DD/MM/AAAA)",
+            value=ini_default.strftime("%d/%m/%Y"),
+            key=f"arca_ini_texto_{int(em_labels[ec])}",
+            help="Escribí la fecha completa, por ejemplo 01/03/2010. Se permiten años desde 1900.",
+        )
+        inicio_act = None
+        try:
+            inicio_act = datetime.strptime(inicio_act_txt.strip(), "%d/%m/%Y").date()
+            if not date(1900, 1, 1) <= inicio_act <= date(2100, 12, 31):
+                inicio_act = None
+        except ValueError:
+            pass
+        if inicio_act is None:
+            st.error("Ingresá una fecha válida en formato DD/MM/AAAA, entre 1900 y 2100.")
 
-        if st.button("Guardar configuración del emisor", key="arca_guardar_cfg"):
+        if st.button("Guardar configuración del emisor", key="arca_guardar_cfg", disabled=inicio_act is None):
             execute("""UPDATE emisores SET condicion_iva='Responsable Monotributo',punto_venta=?,domicilio_fiscal=?,
                        ingresos_brutos=?,inicio_actividades=?,regimen_iva='RESPONSABLE_MONOTRIBUTO',
                        iva_alicuota=0,ambiente_arca=?,precios_incluyen_iva=1 WHERE id=?""",
