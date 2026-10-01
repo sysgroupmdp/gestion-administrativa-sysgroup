@@ -465,6 +465,24 @@ def leer_pdf_permanente(pdf_archivo_id=None, pdf_path=None):
         return Path(path).read_bytes(), Path(path).name
     return None, None
 
+def preparar_dataframe_excel(df):
+    """Copia exportable: fechas con zona como ISO, conservando hora y offset."""
+    def valor_excel(valor):
+        if isinstance(valor, datetime) and valor.tzinfo is not None:
+            if valor.utcoffset() is not None:
+                return valor.isoformat()
+        return valor
+
+    copia = df.copy(deep=True)
+    for columna in copia.columns:
+        serie = copia[columna]
+        if isinstance(serie.dtype, pd.DatetimeTZDtype):
+            copia[columna] = serie.map(valor_excel).astype(object)
+        elif pd.api.types.is_object_dtype(serie.dtype):
+            copia[columna] = serie.map(valor_excel)
+    return copia
+
+
 def money(v):
     try:
         return f"$ {float(v):,.0f}".replace(",", ".")
@@ -3041,13 +3059,18 @@ with tabs[9]:
         """)
         out=io.BytesIO()
         with pd.ExcelWriter(out,engine="openpyxl") as writer:
-            clientes.to_excel(writer,index=False,sheet_name="Clientes")
-            movimientos.to_excel(writer,index=False,sheet_name="Movimientos")
-            saldos.to_excel(writer,index=False,sheet_name="Saldos")
-            honorarios.to_excel(writer,index=False,sheet_name="Honorarios")
-            email_log.to_excel(writer,index=False,sheet_name="Emails")
-        st.download_button("Descargar Excel",data=out.getvalue(),file_name=f"Gestion_administrativa_{date.today().isoformat()}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            preparar_dataframe_excel(clientes).to_excel(writer,index=False,sheet_name="Clientes")
+            preparar_dataframe_excel(movimientos).to_excel(writer,index=False,sheet_name="Movimientos")
+            preparar_dataframe_excel(saldos).to_excel(writer,index=False,sheet_name="Saldos")
+            preparar_dataframe_excel(honorarios).to_excel(writer,index=False,sheet_name="Honorarios")
+            preparar_dataframe_excel(email_log).to_excel(writer,index=False,sheet_name="Emails")
+        st.session_state["exportacion_gestion_completa"] = out.getvalue()
+        st.session_state["exportacion_gestion_nombre"] = f"Gestion_administrativa_{date.today().isoformat()}.xlsx"
+    if tipo_exportacion == "Gestión completa" and st.session_state.get("exportacion_gestion_completa"):
+        st.download_button("Descargar Excel",data=st.session_state["exportacion_gestion_completa"],
+                           file_name=st.session_state["exportacion_gestion_nombre"],
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="descargar_gestion_completa")
 
     if tipo_exportacion == "Cuenta corriente de un cliente":
         st.write("Genera un archivo individual con los movimientos y el saldo pendiente del cliente seleccionado.")
@@ -3103,8 +3126,8 @@ with tabs[9]:
 
                 out_cliente=io.BytesIO()
                 with pd.ExcelWriter(out_cliente,engine="openpyxl") as writer:
-                    resumen.to_excel(writer,index=False,sheet_name="Resumen")
-                    detalle.to_excel(writer,index=False,sheet_name="Cuenta corriente")
+                    preparar_dataframe_excel(resumen).to_excel(writer,index=False,sheet_name="Resumen")
+                    preparar_dataframe_excel(detalle).to_excel(writer,index=False,sheet_name="Cuenta corriente")
                     for hoja in writer.book.worksheets:
                         hoja.freeze_panes="A2"
                         for columna in hoja.columns:
