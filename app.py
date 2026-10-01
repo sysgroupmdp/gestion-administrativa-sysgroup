@@ -3194,7 +3194,9 @@ with tabs[10]:
             ini_default = datetime.strptime(ini_txt, "%Y-%m-%d").date() if ini_txt else date.today()
         except Exception:
             ini_default = date.today()
-        inicio_act = st.date_input("Inicio de actividades", value=ini_default, key="arca_ini")
+        inicio_act = st.date_input("Inicio de actividades", value=ini_default,
+                                   min_value=date(1900, 1, 1), max_value=date(2100, 12, 31),
+                                   key=f"arca_ini_{int(em_labels[ec])}", format="DD/MM/YYYY")
 
         if st.button("Guardar configuración del emisor", key="arca_guardar_cfg"):
             execute("""UPDATE emisores SET condicion_iva='Responsable Monotributo',punto_venta=?,domicilio_fiscal=?,
