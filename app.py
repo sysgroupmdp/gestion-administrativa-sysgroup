@@ -1,4 +1,5 @@
 
+import json
 import streamlit as st
 import sqlite3
 try:
@@ -1686,6 +1687,63 @@ def ensure_emitters():
     conn.commit()
     conn.close()
 
+
+ACTUALIZACION_CLIENTES_20261001 = [{'id': 3, 'cuit': '20047463514', 'nombre': 'BARD ATILIO RENE', 'domicilio': 'De Los Inmigrantes 377 - Mar Del Plata Sur, Buenos Aires', 'email': 'atilio_bard@hotmail.com', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Variable', 'periodo': 'Mes vigente', 'honorario': 0.0}, {'id': 4, 'cuit': '30718359453', 'nombre': 'BIOPARQUE BATAN 2023 S.A', 'domicilio': 'Los Ortiz E/158 Y 162 0 - Barrio Batan, Buenos Aires', 'email': None, 'auto': 0, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 245000.0}, {'id': 12, 'cuit': '30717979296', 'nombre': 'DAPROTIS 4156 MAR DEL PLATA FIDEICOMISO', 'domicilio': 'Misiones 2656 Dpto:1 - Mar Del Plata Sur, Buenos Aires', 'email': 'casaverde.desarrollos@gmail.com', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 170000.0}, {'id': 19, 'cuit': '30711262713', 'nombre': 'DEVELOPTIK S.A.', 'domicilio': 'Hidalgo 1743 - Capital Federal, Ciudad de Buenos Aires', 'email': 'acarlos@infinit.la', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 130000.0}, {'id': 26, 'cuit': '30688684028', 'nombre': 'MAGGI MARCELO Y MAGGI MAURICIO ALEJANDRO SOCIEDAD LEY 19550', 'domicilio': 'Santa Fe 3712 - Bella Vista, Buenos Aires', 'email': 'maggi.mov.suelos@gmail.com', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 350000.0}, {'id': 29, 'cuit': '30716517361', 'nombre': 'MONDEGO DA GUARDA S.A.', 'domicilio': 'Av. Libertad 3865 - Mar Del Plata Norte, Buenos Aires', 'email': 'germanpaulo@hotmail.com', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 430000.0}, {'id': 36, 'cuit': '30717026965', 'nombre': 'ROCA 2936 MAR DEL PLATA SA', 'domicilio': 'Mariani 5873 - Mar Del Plata Norte, Buenos Aires', 'email': None, 'auto': 0, 'emisor_cuit': '27411494239', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 190000.0}, {'id': 16, 'cuit': '30500689826', 'nombre': 'GENARO Y ANDRES DE STEFANO SOCIEDAD ANONIMA COMERCIAL INDUST', 'domicilio': 'Eduardo Comesaña 4385 - Ciudadela, Buenos Aires', 'email': None, 'auto': 0, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 192000.0}, {'id': 41, 'cuit': '33718243829', 'nombre': 'UP EXPLANADA S.A.', 'domicilio': 'Independencia 3336 - Mar Del Plata Norte, Buenos Aires', 'email': None, 'auto': 0, 'emisor_cuit': '27411494239', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vigente', 'honorario': 170000.0}, {'id': 2, 'cuit': '30718290747', 'nombre': 'ANGELICO CORP S.A.', 'domicilio': '3 De Febrero 5432 - Mar Del Plata Norte, Buenos Aires', 'email': 'administracion@grupoangelico.com.ar', 'auto': 1, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Variable', 'periodo': 'Mes vencido', 'honorario': 0.0}, {'id': 9, 'cuit': '33715613439', 'nombre': 'AUTOPARTES DIMES S. A.', 'domicilio': '11 De Septiembre 5957 - Mar Del Plata Norte, Buenos Aires', 'email': 'conta2@distrisuper.com', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 101000.0}, {'id': 10, 'cuit': '30609249206', 'nombre': 'DISTRISUPER S R L', 'domicilio': '11 De Septiembre 5957 - Mar Del Plata Norte, Buenos Aires', 'email': 'conta2@distrisuper.com', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 190000.0}, {'id': 17, 'cuit': '30714816981', 'nombre': 'GRUPO BOREAS S.R.L', 'domicilio': 'Independencia 3632 - Mar Del Plata Sur, Buenos Aires', 'email': 'administracion@grupoboreas.com.ar', 'auto': 1, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 200000.0}, {'id': 23, 'cuit': '30708043636', 'nombre': 'LOGISMAR SRL', 'domicilio': 'Solis 9239 - Mar Del Plata Sur, Buenos Aires', 'email': 'logismarpatriciaquiroga@gmail.com', 'auto': 1, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 145000.0}, {'id': 24, 'cuit': '30711294704', 'nombre': 'LUBRIEL S.R.L.', 'domicilio': '39 478 - Santa Teresita, Buenos Aires', 'email': None, 'auto': 0, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 195000.0}, {'id': 28, 'cuit': '30716570440', 'nombre': 'MANALER S.A.', 'domicilio': 'Falkner 4335 - Mar Del Plata Norte, Buenos Aires', 'email': 'info@manaler.com.ar', 'auto': 1, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Variable', 'periodo': 'Mes vencido', 'honorario': 0.0}, {'id': 32, 'cuit': '20259572453', 'nombre': 'PEZZANA DIEGO CARLOS', 'domicilio': 'Av Peralta Ramos 535 - Mar Del Plata Sur, Buenos Aires', 'email': 'pisosxl@gmail.com', 'auto': 1, 'emisor_cuit': '20351407248', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 240000.0}, {'id': 33, 'cuit': '30575170125', 'nombre': 'PROSEGUR S A', 'domicilio': 'Gral Roca 4530 - Florida, Buenos Aires', 'email': 'Vanesa.Tercia@prosegur.com', 'auto': 1, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 275000.0}, {'id': 22, 'cuit': '30546969874', 'nombre': 'TRANSPORTADORA DE CAUDALES JUNCADELLA SOCIEDAD ANONIMA', 'domicilio': 'Vicente Lopez 1145 - Mar Del Plata Norte, Buenos Aires', 'email': 'Vanesa.Tercia@prosegur.com', 'auto': 1, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 380000.0}, {'id': 42, 'cuit': '33636629559', 'nombre': 'USAI ANALIA USAI GABRIELA Y USAI ESTEBAN S H', 'domicilio': 'Echeverria 223 - Mar Del Plata Sur, Buenos Aires', 'email': 'elreydelcalzone@yahoo.com.ar', 'auto': 1, 'emisor_cuit': '20377695365', 'tipo_honorario': 'Fijo', 'periodo': 'Mes vencido', 'honorario': 100000.0}]
+
+def aplicar_actualizacion_clientes_20261001():
+    """Actualización única autorizada; no escribe movimientos ni comprobantes."""
+    clave = "actualizacion_clientes_facturas_20261001_v1"
+    conn = get_conn()
+    try:
+        if getattr(conn, "is_postgres", False):
+            conn.execute("SELECT pg_advisory_xact_lock(20261001, 20)")
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT valor FROM app_meta WHERE clave=?", (clave,)).fetchone():
+            conn.commit()
+            return False
+        if getattr(conn, "is_postgres", False):
+            conn.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS tipo_honorario TEXT")
+            conn.execute("ALTER TABLE clientes ADD COLUMN IF NOT EXISTS periodo_facturacion TEXT")
+        else:
+            columnas = {r["name"] for r in conn.execute("PRAGMA table_info(clientes)").fetchall()}
+            for columna in ("tipo_honorario", "periodo_facturacion"):
+                if columna not in columnas:
+                    conn.execute(f"ALTER TABLE clientes ADD COLUMN {columna} TEXT")
+        emisores = conn.execute("SELECT id,cuit FROM emisores").fetchall()
+        anteriores = []
+        for cambio in ACTUALIZACION_CLIENTES_20261001:
+            actual = conn.execute("SELECT * FROM clientes WHERE id=?", (cambio["id"],)).fetchone()
+            if not actual or re.sub(r"\D", "", str(actual["cuit"] or "")) != cambio["cuit"]:
+                raise ValueError(f"No coincide el cliente ID {cambio['id']}; no se aplicó la actualización.")
+            coincidencias = [e for e in emisores if re.sub(r"\D", "", str(e["cuit"] or "")) == cambio["emisor_cuit"]]
+            if len(coincidencias) != 1:
+                raise ValueError("No se pudo vincular un emisor; no se aplicó la actualización.")
+            anteriores.append(dict(actual))
+            conn.execute("""UPDATE clientes SET nombre=?,domicilio=?,condicion_iva_receptor_id=1,
+                condicion_iva_receptor_desc='Responsable Inscripto',
+                email_facturacion=COALESCE(?,email_facturacion),envio_automatico_factura=?,
+                emisor_predeterminado_id=?,tipo_honorario=?,periodo_facturacion=?,honorario=?
+                WHERE id=?""", (cambio["nombre"],cambio["domicilio"],cambio["email"],cambio["auto"],
+                int(coincidencias[0]["id"]),cambio["tipo_honorario"],cambio["periodo"],cambio["honorario"],cambio["id"]))
+            if float(actual["honorario"] or 0) != cambio["honorario"]:
+                conn.execute("INSERT INTO honorarios(cliente_id,vigente_desde,honorario,nota) VALUES(?,?,?,?)",
+                    (cambio["id"],"2026-10-01",cambio["honorario"],
+                     "Actualización facturas 01/10/2026; variable sin importe fijo" if cambio["tipo_honorario"] == "Variable"
+                     else "Honorario fijo actualizado según facturas 01/10/2026"))
+                conn.execute("UPDATE clientes SET vigente_desde=? WHERE id=?", ("2026-10-01",cambio["id"]))
+        conn.execute("INSERT INTO app_meta(clave,valor) VALUES(?,?)",
+                     (clave + "_respaldo",json.dumps(anteriores,ensure_ascii=False,default=str)))
+        conn.execute("INSERT INTO app_meta(clave,valor) VALUES(?,?)",(clave,"20 clientes actualizados"))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_emisores(active_only=True):
     where = "WHERE activo=1" if active_only else ""
     return query_df(f"SELECT * FROM emisores {where} ORDER BY nombre")
@@ -2281,6 +2339,12 @@ init_db()
 ensure_initial_data()
 ensure_emitters()
 ensure_invoice_items()
+try:
+    if aplicar_actualizacion_clientes_20261001():
+        st.success("Se actualizaron los datos de 20 clientes, conservando movimientos y pagos.")
+except Exception as error_actualizacion:
+    st.error(f"No se aplicó la actualización de clientes: {error_actualizacion}")
+    st.stop()
 
 st.title("S&S Group · Gestión Administrativa")
 st.caption("Clientes · Facturación · Cuenta corriente · Pagos · Avisos · Trabajos puntuales · ARCA")
@@ -2362,9 +2426,15 @@ with tabs[1]:
                 default_idx = ids.index(int(cliente_row["emisor_predeterminado_id"]))
 
         c1, c2, c3 = st.columns(3)
-        emisor_sel = c1.selectbox("Emisor", list(emisor_options.keys()), index=default_idx, key="ef_emisor")
+        emisor_sel = c1.selectbox("Emisor", list(emisor_options.keys()), index=default_idx, key=f"ef_emisor_{cliente_id_previo or 'nuevo'}")
         fecha_emision = c2.date_input("Fecha de emisión", value=date.today(), key="ef_fecha")
-        tipo_periodo = c3.selectbox("Período", ["Mes vigente","Mes vencido","Manual"], key="ef_periodo")
+        periodos_disponibles = ["Mes vigente","Mes vencido","Manual"]
+        periodo_habitual = str(cliente_row.get("periodo_facturacion") or "Mes vigente") if cliente_row is not None else "Mes vigente"
+        tipo_periodo = c3.selectbox("Período", periodos_disponibles,
+                                   index=periodos_disponibles.index(periodo_habitual) if periodo_habitual in periodos_disponibles else 0,
+                                   key=f"ef_periodo_{cliente_id_previo or 'nuevo'}")
+        if cliente_row is not None and cliente_row.get("tipo_honorario") == "Variable":
+            st.info("Este cliente tiene honorario variable. Cargá el importe correspondiente a este trabajo o período.")
 
         manual_desde = manual_hasta = None
         if tipo_periodo == "Manual":
