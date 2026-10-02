@@ -20,10 +20,9 @@ import ssl
 from datetime import timedelta
 from email.message import EmailMessage
 from pypdf import PdfReader
-from arca_ws import (ARCAError, CBTE_CODES, digits, generar_clave_y_csr, wsaa_login,
-                     wsfe_ultimo_autorizado, wsfe_puntos_venta, wsfe_condiciones_iva_receptor,
-                     wsfe_solicitar_cae)
-from fiscal_pdf import generar_pdf_factura
+# La gestión incorpora PDFs originales; no usa el conector fiscal.
+def digits(value):
+    return re.sub(r"\D", "", str(value or ""))
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "control_cuentas.db"
@@ -1802,277 +1801,12 @@ def gmail_configurada():
     return bool(_secret("gmail_app_password"))
 
 def enviar_factura_por_email(comprobante_id, destinatario=None):
-    row = query_df("""
-        SELECT a.*, c.nombre cliente, c.email_facturacion, c.envio_automatico_factura
-        FROM comprobantes_arca a
-        JOIN clientes c ON c.id=a.cliente_id
-        WHERE a.id=?
-    """, (comprobante_id,))
-    if len(row) != 1:
-        return False, "No se encontró el comprobante."
-    r = row.iloc[0]
-    destino = (destinatario or r.get("email_facturacion") or "").strip()
-    if not destino:
-        return False, "El cliente no tiene email de facturación configurado."
-    if str(r.get("estado_arca") or "").upper() != "AUTORIZADA":
-        return False, "La factura todavía no está autorizada por ARCA."
-    pdf_bytes, pdf_name = leer_pdf_permanente(r.get("pdf_archivo_id"), r.get("pdf_path"))
-    if not pdf_bytes:
-        return False, "La factura autorizada todavía no tiene un PDF disponible."
-    if not gmail_configurada():
-        return False, "Falta configurar la credencial privada de Gmail en los secretos de la app."
-
-    try:
-        password = _secret("gmail_app_password")
-        msg = EmailMessage()
-        msg["From"] = MAIL_FROM
-        msg["To"] = destino
-        msg["Subject"] = MAIL_SUBJECT
-        msg.set_content(MAIL_BODY)
-        msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_name or "factura.pdf")
-
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as smtp:
-            smtp.login(MAIL_FROM, password)
-            smtp.send_message(msg)
-
-        now = datetime.now().isoformat(timespec="seconds")
-        execute("UPDATE comprobantes_arca SET email_enviado=1,email_enviado_a=?,email_enviado_en=?,email_error=NULL WHERE id=?",
-                (destino, now, comprobante_id))
-        execute("INSERT INTO email_log(comprobante_id,cliente_id,destinatario,asunto,estado,detalle,fecha_hora) VALUES(?,?,?,?,?,?,?)",
-                (comprobante_id, int(r["cliente_id"]), destino, MAIL_SUBJECT, "ENVIADO", None, now))
-        return True, f"Email enviado a {destino}."
-    except Exception as e:
-        now = datetime.now().isoformat(timespec="seconds")
-        detalle = str(e)[:500]
-        execute("UPDATE comprobantes_arca SET email_error=? WHERE id=?", (detalle, comprobante_id))
-        execute("INSERT INTO email_log(comprobante_id,cliente_id,destinatario,asunto,estado,detalle,fecha_hora) VALUES(?,?,?,?,?,?,?)",
-                (comprobante_id, int(r["cliente_id"]), destino, MAIL_SUBJECT, "ERROR", detalle, now))
-        return False, f"No se pudo enviar el email: {detalle}"
-
-def registrar_factura_autorizada(comprobante_id, pdf_path=None):
-    """Registra la deuda de una factura ya autorizada. No vuelve a emitir fiscalmente."""
-    row = query_df("SELECT * FROM comprobantes_arca WHERE id=?", (comprobante_id,))
-    if len(row) != 1:
-        return False, "Comprobante inexistente."
-    r = row.iloc[0]
-    pdf_archivo_id = None
-    if pdf_path:
-        p = Path(pdf_path)
-        if p.exists():
-            pdf_archivo_id = guardar_pdf_permanente(p.name, p.read_bytes())
-        execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA', pdf_path=?, pdf_archivo_id=? WHERE id=?",
-                (str(pdf_path), pdf_archivo_id, comprobante_id))
-    else:
-        execute("UPDATE comprobantes_arca SET estado_arca='AUTORIZADA' WHERE id=?", (comprobante_id,))
-
-    nro = r.get("numero_comprobante")
-    pv = r.get("punto_venta")
-    t = r.get("tipo_comprobante") or ""
-    comp_ref = f"ARCA-{t}-{int(pv or 0):05d}-{int(nro or comprobante_id):08d}"
-    try:
-        execute("""INSERT INTO movimientos
-        (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,pdf_path,pdf_archivo_id,estado_conciliacion,creado_en)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (r["fecha_emision"], int(r["cliente_id"]), "Factura/Cargo", "Factura autorizada ARCA", float(r["total"]),
-         r["periodo_desde"] or pd.to_datetime(r["fecha_emision"]).date().replace(day=1).isoformat(), comp_ref,
-         str(pdf_path) if pdf_path else None, pdf_archivo_id,
-         "Pendiente", datetime.now().isoformat()))
-    except DBIntegrityError:
-        pass
-
-    if not pdf_path:
-        return True, "Factura autorizada y deuda registrada. Falta regenerar el PDF antes de enviarla."
-    cliente = query_df("SELECT email_facturacion,envio_automatico_factura FROM clientes WHERE id=?", (int(r["cliente_id"]),))
-    if len(cliente) and int(cliente.iloc[0].get("envio_automatico_factura") or 0) == 1:
-        ok, msg = enviar_factura_por_email(comprobante_id)
-        if not ok:
-            return True, "Factura autorizada y registrada. " + msg
-        return True, msg
-    return True, "Factura autorizada y registrada. Envío automático desactivado para este cliente."
-
-
-def arca_credenciales(cuit):
-    d = digits(cuit)
-    cert_b64 = _secret(f"ARCA_{d}_CERT_B64")
-    key_b64 = _secret(f"ARCA_{d}_KEY_B64")
-    if not cert_b64 or not key_b64:
-        return None, None
-    try:
-        return base64.b64decode(cert_b64), base64.b64decode(key_b64)
-    except Exception as e:
-        raise ARCAError(f"Credenciales ARCA mal codificadas para CUIT {cuit}: {e}")
-
-
-def arca_configurada_para(cuit):
-    cert, key = arca_credenciales(cuit)
-    return bool(cert and key)
-
-
-def _fiscal_amounts(emisor, tipo_comprobante, importe_ingresado):
-    # Los tres emisores son monotributistas: sólo Factura C, sin IVA discriminado.
-    tipo = str(tipo_comprobante or "C").upper()
-    if tipo != "C":
-        raise ARCAError("Los emisores configurados son monotributistas: sólo se permite Factura C.")
-    total = round(float(importe_ingresado), 2)
-    return total, total, 0.0, 0.0
-
-
-IVA_RECEPTOR_OPCIONES = {
-    "Responsable Inscripto": 1,
-    "IVA Exento": 4,
-    "Consumidor Final": 5,
-    "Responsable Monotributo": 6,
-    "Sujeto No Categorizado": 7,
-    "IVA No Alcanzado": 15,
-}
-
-def _doc_receptor(cliente, total):
-    doc = digits(cliente.get("cuit") or "")
-    cond = int(cliente.get("condicion_iva_receptor_id") or 0)
-    if len(doc) == 11:
-        return 80, doc  # CUIT
-    if len(doc) in (7, 8):
-        return 96, doc  # DNI
-    if cond == 5 and float(total) < 10000000:
-        return 99, "0"  # Consumidor final no identificado
-    return None, None
-
-
-def _validate_production_ready(emisor, cliente, comprobante):
-    faltan = []
-    if not app_password_configurada():
-        faltan.append("contraseña privada de acceso a la app")
-    if not str(emisor.get("domicilio_fiscal") or "").strip():
-        faltan.append("domicilio fiscal del emisor")
-    if not int(emisor.get("punto_venta") or 0):
-        faltan.append("punto de venta ARCA")
-    if not arca_configurada_para(emisor.get("cuit")):
-        faltan.append("certificado y clave privada ARCA")
-    if not cliente.get("condicion_iva_receptor_id") or pd.isna(cliente.get("condicion_iva_receptor_id")):
-        faltan.append("condición IVA del cliente")
-    doc_tipo, doc_nro = _doc_receptor(cliente, float(comprobante.get("total") or 0))
-    if not doc_tipo:
-        faltan.append("CUIT/DNI del cliente (o Consumidor Final por debajo del límite de identificación)")
-    if not comprobante.get("fecha_vto_pago") or pd.isna(comprobante.get("fecha_vto_pago")):
-        faltan.append("fecha de vencimiento de pago")
-    if str(comprobante.get("tipo_comprobante") or "C").upper() != "C":
-        faltan.append("tipo de comprobante C")
-    return faltan
-
-
-def probar_conexion_arca(emisor_id):
-    emis = query_df("SELECT * FROM emisores WHERE id=?", (emisor_id,))
-    if len(emis) != 1:
-        raise ARCAError("Emisor inexistente.")
-    e = emis.iloc[0]
-    cert, key = arca_credenciales(e["cuit"])
-    if not cert or not key:
-        raise ARCAError("Faltan certificado/clave ARCA en Secrets.")
-    ambiente = str(e.get("ambiente_arca") or "HOMOLOGACION").upper()
-    ta = wsaa_login(cert, key, ambiente=ambiente)
-    ptos = wsfe_puntos_venta(ta, e["cuit"], ambiente)
-    return ta, ptos
+    return False, "Envío bloqueado: incorporá el PDF original emitido en ARCA."
 
 
 def emitir_comprobante_arca(comprobante_id):
-    row = query_df("""
-        SELECT a.*, c.nombre cliente_nombre,c.cuit cliente_cuit,c.domicilio cliente_domicilio,
-               c.email_facturacion,c.envio_automatico_factura,c.condicion_iva_receptor_id,c.condicion_iva_receptor_desc,
-               e.nombre emisor_nombre,e.cuit emisor_cuit,e.condicion_iva,e.punto_venta AS emisor_punto_venta,e.domicilio_fiscal,
-               e.ingresos_brutos,e.inicio_actividades,e.regimen_iva,e.iva_alicuota,e.ambiente_arca,e.precios_incluyen_iva
-        FROM comprobantes_arca a
-        JOIN clientes c ON c.id=a.cliente_id
-        JOIN emisores e ON e.id=a.emisor_id
-        WHERE a.id=?
-    """, (comprobante_id,))
-    if len(row) != 1:
-        return False, "No se encontró el comprobante."
-    r = row.iloc[0]
-    if str(r.get("estado_arca") or "").upper() == "AUTORIZADA" and str(r.get("cae") or ""):
-        return True, "La factura ya está autorizada por ARCA. No se volvió a emitir."
+    return False, "La emisión desde Gestión está deshabilitada. Emití en ARCA y cargá el PDF original."
 
-    emisor = {
-        "id": r["emisor_id"], "nombre": r["emisor_nombre"], "cuit": r["emisor_cuit"],
-        "condicion_iva": r.get("condicion_iva"), "punto_venta": r.get("emisor_punto_venta"),
-        "domicilio_fiscal": r.get("domicilio_fiscal"), "ingresos_brutos": r.get("ingresos_brutos"),
-        "inicio_actividades": r.get("inicio_actividades"), "regimen_iva": r.get("regimen_iva"),
-        "iva_alicuota": r.get("iva_alicuota"), "ambiente_arca": r.get("ambiente_arca"),
-        "precios_incluyen_iva": r.get("precios_incluyen_iva")
-    }
-    cliente = {
-        "id": r["cliente_id"], "nombre": r["cliente_nombre"], "cuit": r["cliente_cuit"],
-        "domicilio": r.get("cliente_domicilio"),
-        "condicion_iva_receptor_id": r.get("condicion_iva_receptor_id"),
-        "condicion_iva_receptor_desc": r.get("condicion_iva_receptor_desc")
-    }
-    faltan = _validate_production_ready(emisor, cliente, r)
-    if faltan:
-        return False, "Falta completar: " + ", ".join(faltan) + "."
-
-    try:
-        cert, key = arca_credenciales(emisor["cuit"])
-        ambiente = str(emisor.get("ambiente_arca") or "HOMOLOGACION").upper()
-        tipo = "C"
-        cbte_tipo = CBTE_CODES[tipo]
-        total, neto, iva, rate = _fiscal_amounts(emisor, tipo, float(r["total"]))
-        ta = wsaa_login(cert, key, ambiente=ambiente)
-        ultimo = wsfe_ultimo_autorizado(ta, emisor["cuit"], int(emisor["punto_venta"]), cbte_tipo, ambiente)
-        siguiente = ultimo + 1
-        f_em = datetime.strptime(str(r["fecha_emision"]), "%Y-%m-%d").strftime("%Y%m%d")
-        f_desde = datetime.strptime(str(r["periodo_desde"]), "%Y-%m-%d").strftime("%Y%m%d") if r.get("periodo_desde") else None
-        f_hasta = datetime.strptime(str(r["periodo_hasta"]), "%Y-%m-%d").strftime("%Y%m%d") if r.get("periodo_hasta") else None
-        f_vto = datetime.strptime(str(r["fecha_vto_pago"]), "%Y-%m-%d").strftime("%Y%m%d")
-        resp = wsfe_solicitar_cae(
-            ta, emisor["cuit"], ambiente,
-            punto_venta=int(emisor["punto_venta"]), cbte_tipo=cbte_tipo, concepto=2,
-            doc_tipo=_doc_receptor(cliente, total)[0], doc_nro=_doc_receptor(cliente, total)[1], cbte_nro=siguiente, fecha_cbte=f_em,
-            imp_total=total, imp_neto=neto, imp_iva=iva,
-            condicion_iva_receptor_id=int(cliente["condicion_iva_receptor_id"]),
-            fecha_serv_desde=f_desde, fecha_serv_hasta=f_hasta, fecha_vto_pago=f_vto,
-            iva_rate=rate if iva > 0 else None,
-        )
-        obs_txt = "; ".join(f"{o['code']}: {o['msg']}" for o in resp.get("observaciones", []))
-        err_txt = "; ".join(f"{e['code']}: {e['msg']}" for e in resp.get("errors", []))
-        if not resp.get("ok"):
-            execute("UPDATE comprobantes_arca SET estado_arca='RECHAZADA',arca_error=?,arca_observaciones=? WHERE id=?",
-                    (err_txt or f"Resultado ARCA: {resp.get('resultado')}", obs_txt or None, comprobante_id))
-            return False, "ARCA rechazó la factura: " + (err_txt or str(resp.get("resultado")))
-
-        cae = str(resp["cae"])
-        cae_vto_raw = str(resp["cae_vto"])
-        cae_vto = datetime.strptime(cae_vto_raw, "%Y%m%d").strftime("%Y-%m-%d") if len(cae_vto_raw) == 8 else cae_vto_raw
-        execute("""UPDATE comprobantes_arca
-                   SET estado_arca='AUTORIZADA',punto_venta=?,numero_comprobante=?,cae=?,vencimiento_cae=?,
-                       cbte_tipo_codigo=?,imp_neto=?,imp_iva=?,total=?,arca_observaciones=?,arca_error=NULL
-                   WHERE id=?""",
-                (int(emisor["punto_venta"]), int(resp["cbte_nro"]), cae, cae_vto, cbte_tipo, neto, iva, total,
-                 obs_txt or None, comprobante_id))
-
-        # Persistimos CAE antes de generar PDF para nunca perder una autorización fiscal ya obtenida.
-        comp = query_df("SELECT * FROM comprobantes_arca WHERE id=?", (comprobante_id,)).iloc[0].to_dict()
-        comp["doc_tipo"] = _doc_receptor(cliente, total)[0]
-        items_df = query_df("SELECT * FROM comprobante_items WHERE comprobante_id=? ORDER BY id", (comprobante_id,))
-        items = items_df.to_dict("records")
-        safe = f"Factura_{tipo}_{int(emisor['punto_venta']):05d}-{int(resp['cbte_nro']):08d}_{digits(emisor['cuit'])}.pdf"
-        pdf_path = PDF_DIR / safe
-        try:
-            generar_pdf_factura(pdf_path, emisor=emisor, cliente=cliente, comprobante=comp, items=items)
-        except Exception as pdf_e:
-            registrar_factura_autorizada(comprobante_id, None)
-            execute("UPDATE comprobantes_arca SET arca_error=? WHERE id=?",
-                    (f"CAE obtenido correctamente; error generando PDF: {pdf_e}", comprobante_id))
-            return True, f"ARCA autorizó la factura (CAE {cae}), pero hubo un problema generando el PDF: {pdf_e}"
-
-        ok_reg, msg_reg = registrar_factura_autorizada(comprobante_id, pdf_path)
-        prefix = "PRODUCCIÓN" if ambiente == "PRODUCCION" else "HOMOLOGACIÓN"
-        return True, f"{prefix}: factura autorizada. N° {int(emisor['punto_venta']):05d}-{int(resp['cbte_nro']):08d} · CAE {cae}. {msg_reg}"
-    except ARCAError as e:
-        execute("UPDATE comprobantes_arca SET arca_error=? WHERE id=?", (str(e)[:1000], comprobante_id))
-        return False, str(e)
-    except Exception as e:
-        execute("UPDATE comprobantes_arca SET arca_error=? WHERE id=?", (str(e)[:1000], comprobante_id))
-        return False, f"Error inesperado al emitir: {e}"
 
 def extract_pdf_text(uploaded):
     try:
@@ -2298,7 +2032,7 @@ apply_emitter_fiscal_details_20261001()
 ensure_invoice_items()
 
 st.title("S&S Group · Gestión Administrativa")
-st.caption("Clientes · Facturación · Cuenta corriente · Pagos · Avisos · Trabajos puntuales · ARCA")
+st.caption("Clientes · Facturación · Cuenta corriente · Pagos · Avisos · Trabajos puntuales · PDF de ARCA")
 mensaje_pago_guardado=st.session_state.pop("pago_guardado_msg",None)
 if mensaje_pago_guardado:
     st.toast(mensaje_pago_guardado,icon="✅")
@@ -2306,7 +2040,7 @@ if mensaje_pago_guardado:
 # Los avisos mensuales no se generan al abrir la app.
 # Se generan desde la pestaña "Avisos de pago" para evitar cargos accidentales.
 
-tabs = st.tabs(["Panel","Emitir factura","Facturas recibidas/PDF","Avisos de pago","Pagos","Trabajos extras","Clientes","Ítems / Leyendas","Cuenta corriente","Exportar","ARCA"])
+tabs = st.tabs(["Panel","Facturas PDF (ARCA)","Avisos de pago","Pagos","Trabajos extras","Clientes","Ítems / Leyendas","Cuenta corriente","Exportar","Historial anterior"])
 
 with tabs[0]:
     saldos = balances_df()
@@ -2334,134 +2068,8 @@ with tabs[0]:
 
 
 with tabs[1]:
-    st.subheader("Emitir factura C")
-    st.caption("Los tres emisores son monotributistas. El sistema sólo emite Factura C.")
-
-    emisores = get_emisores(True)
-    if len(emisores) == 0:
-        st.warning("No hay emisores configurados.")
-    else:
-        modo_cliente = st.radio("Cliente", ["Habitual", "Ocasional / nuevo"], horizontal=True, key="ef_modo_cliente")
-        cliente_row = None
-        cliente_id_previo = None
-        cliente_nombre = ""
-        documento_cliente = ""
-        email_cliente = ""
-        cond_actual = ""
-
-        if modo_cliente == "Habitual":
-            clientes = get_clientes(True)
-            nom = st.selectbox("Cliente habitual", clientes["nombre"].tolist(), key="ef_cliente")
-            cliente_row = clientes[clientes["nombre"] == nom].iloc[0]
-            cliente_id_previo = int(cliente_row["id"])
-            cliente_nombre = str(cliente_row["nombre"])
-            documento_cliente = str(cliente_row.get("cuit") or "")
-            email_cliente = str(cliente_row.get("email_facturacion") or "")
-            cond_actual = str(cliente_row.get("condicion_iva_receptor_desc") or "")
-        else:
-            cno1, cno2 = st.columns(2)
-            cliente_nombre = cno1.text_input("Nombre / Razón social", key="ef_oc_nombre")
-            documento_cliente = cno2.text_input("CUIT o DNI", key="ef_oc_doc",
-                                                help="Para Consumidor Final puede quedar vacío si ARCA permite no identificar la operación.")
-            email_cliente = st.text_input("Email (opcional)", key="ef_oc_email")
-
-        cond_labels = ["Seleccionar..."] + list(IVA_RECEPTOR_OPCIONES.keys())
-        cond_index = cond_labels.index(cond_actual) if cond_actual in cond_labels else 0
-        condicion_cliente = st.selectbox("Condición IVA del cliente", cond_labels, index=cond_index, key="ef_cond_iva")
-
-        emisor_options = {emisor_label(r): int(r["id"]) for _, r in emisores.iterrows()}
-        default_idx = 0
-        if cliente_row is not None and "emisor_predeterminado_id" in cliente_row.index and pd.notna(cliente_row["emisor_predeterminado_id"]):
-            ids = list(emisor_options.values())
-            if int(cliente_row["emisor_predeterminado_id"]) in ids:
-                default_idx = ids.index(int(cliente_row["emisor_predeterminado_id"]))
-
-        c1, c2, c3 = st.columns(3)
-        emisor_sel = c1.selectbox("Emisor", list(emisor_options.keys()), index=default_idx, key="ef_emisor")
-        fecha_emision = c2.date_input("Fecha de emisión", value=date.today(), key="ef_fecha")
-        tipo_periodo = c3.selectbox("Período", ["Mes vigente","Mes vencido","Manual"], key="ef_periodo")
-
-        manual_desde = manual_hasta = None
-        if tipo_periodo == "Manual":
-            p1, p2 = st.columns(2)
-            manual_desde = p1.date_input("Desde", value=date.today().replace(day=1), key="ef_desde")
-            manual_hasta = p2.date_input("Hasta", value=date.today(), key="ef_hasta")
-
-        p_desde, p_hasta, p_texto = factura_periodo(fecha_emision, tipo_periodo, manual_desde, manual_hasta)
-        st.caption(f"Período facturado: **{p_texto}** · Comprobante: **Factura C**")
-        fecha_vto_pago = st.date_input("Vencimiento de pago", value=fecha_emision + timedelta(days=10), key="ef_vto_pago")
-
-        catalogo = catalogo_items()
-        etiquetas = {f"{r['nombre']} — {r['descripcion']}": r for _, r in catalogo.iterrows()}
-        seleccion = st.multiselect("Ítems / leyendas", list(etiquetas.keys()), key="ef_items")
-        items = []
-        for idx, etiqueta in enumerate(seleccion):
-            r = etiquetas[etiqueta]
-            with st.expander(r["nombre"], expanded=True):
-                desc = st.text_area("Descripción", value=r["descripcion"], key=f"ef_desc_{idx}_{r['id']}")
-                a, b = st.columns(2)
-                cantidad = a.number_input("Cantidad", min_value=0.01, value=1.0, step=1.0, key=f"ef_cant_{idx}_{r['id']}")
-                precio = b.number_input("Precio unitario", min_value=0.0, value=float(r["precio_sugerido"] or 0), step=1000.0, key=f"ef_precio_{idx}_{r['id']}")
-                items.append({"item_catalogo_id": int(r["id"]), "descripcion": desc,
-                              "cantidad": cantidad, "precio_unitario": precio, "subtotal": cantidad * precio})
-
-        st.markdown("#### Ítem libre")
-        libre = st.text_area("Descripción", key="ef_libre_desc")
-        l1, l2 = st.columns(2)
-        lc = l1.number_input("Cantidad", min_value=0.0, value=0.0, step=1.0, key="ef_libre_cant")
-        lp = l2.number_input("Precio unitario", min_value=0.0, value=0.0, step=1000.0, key="ef_libre_precio")
-        if libre.strip() and lc > 0:
-            items.append({"item_catalogo_id": None, "descripcion": libre.strip(),
-                          "cantidad": lc, "precio_unitario": lp, "subtotal": lc * lp})
-
-        total = sum(float(x["subtotal"]) for x in items)
-        st.metric("Total", money(total))
-        with st.expander("Observaciones opcionales"):
-            obs = st.text_area("Observaciones", key="ef_obs")
-
-        b1, b2 = st.columns(2)
-        guardar = b1.button("Guardar borrador", key="ef_guardar")
-        emitir = b2.button("Emitir ahora en ARCA", type="primary", key="ef_emitir_arca")
-
-        if guardar or emitir:
-            if condicion_cliente == "Seleccionar...":
-                st.error("Seleccioná la condición IVA del cliente.")
-            elif not items:
-                st.error("Agregá al menos un ítem.")
-            elif total <= 0:
-                st.error("El total debe ser mayor a cero.")
-            elif not cliente_nombre.strip():
-                st.error("Ingresá el cliente.")
-            else:
-                try:
-                    if modo_cliente == "Ocasional / nuevo":
-                        cid = crear_o_recuperar_cliente_ocasional(
-                            cliente_nombre, documento_cliente, condicion_cliente, email_cliente
-                        )
-                    else:
-                        cid = int(cliente_id_previo)
-                        guardar_datos_fiscales_cliente(cid, condicion_cliente, documento_cliente, email_cliente)
-
-                    emisor_id = emisor_options[emisor_sel]
-                    fid, total_guardado = guardar_borrador_arca(
-                        cid, emisor_id, fecha_emision, p_desde, p_hasta, p_texto,
-                        tipo_periodo, "C", items, obs
-                    )
-                    execute("UPDATE comprobantes_arca SET fecha_vto_pago=?,tipo_comprobante='C' WHERE id=?",
-                            (fecha_vto_pago.isoformat(), fid))
-                    if guardar:
-                        st.success(f"Borrador #{fid} guardado por {money(total_guardado)}.")
-                    else:
-                        ok, msg = emitir_comprobante_arca(fid)
-                        (st.success if ok else st.error)(msg)
-                        if ok and modo_cliente == "Ocasional / nuevo":
-                            st.info("El cliente ocasional quedó guardado automáticamente en Clientes y la factura quedó en Pendientes de pago.")
-                except Exception as e:
-                    st.error(str(e))
-
-with tabs[2]:
-    st.subheader("Facturas existentes / ARCA")
-    st.write("Podés incorporar facturas emitidas por este sistema, descargadas de ARCA o emitidas anteriormente por otro medio.")
+    st.subheader("Cargar facturas emitidas en ARCA")
+    st.write("Emití la factura en ARCA y cargá aquí el PDF original. El sistema guarda el archivo y registra el importe en la cuenta corriente; no emite ni envía comprobantes fiscales.")
 
     st.markdown("#### Carga masiva con lectura automática")
     archivos_pdf = st.file_uploader("Facturas PDF", type=["pdf"], accept_multiple_files=True, key="facturas_masivas")
@@ -2485,7 +2093,7 @@ with tabs[2]:
             })
         df = pd.DataFrame(parsed_rows)
         st.dataframe(df[["archivo", "cliente", "fecha", "comprobante", "importe", "estado"]], use_container_width=True, hide_index=True)
-        st.caption("Se guardan automáticamente sólo las filas reconocidas. Las que digan REVISAR podés cargarlas en el formulario manual de abajo sin perder el PDF.")
+        st.caption("Al confirmar se guardan sólo las filas reconocidas. Las que digan REVISAR podés cargarlas en el formulario manual de abajo sin perder el PDF.")
         with st.expander("Diagnóstico de lectura ARCA"):
             st.caption("Sirve para ver qué está pudiendo leer el sistema del PDF. No guarda nada.")
             for f in archivos_pdf:
@@ -2527,7 +2135,7 @@ with tabs[2]:
     st.caption("También permite incorporar una factura anterior de un cliente ocasional que todavía no existe en el control.")
     clientes = get_clientes(True)
     with st.form("factura_manual_asistida"):
-        origen = st.selectbox("Origen", ["ARCA", "Emitida por el sistema", "Factura anterior / otro"], key="fm_origen")
+        origen = st.selectbox("Origen", ["ARCA", "Factura anterior / otro"], key="fm_origen")
         modo_fm = st.radio("Cliente", ["Cliente existente", "Nuevo cliente ocasional"], horizontal=True, key="fm_modo_cliente")
 
         if modo_fm == "Cliente existente":
@@ -2547,10 +2155,14 @@ with tabs[2]:
         comp = c2.text_input("Número de comprobante", placeholder="Ej.: 00003-00000125", key="fm_comp")
         importe = st.number_input("Importe total", min_value=0.0, step=1000.0, key="fm_imp")
         archivo = st.file_uploader("Adjuntar PDF", type=["pdf"], key="fm_pdf")
-        st.caption("El PDF es recomendable, pero si no lo tenés también podés registrar la factura manualmente.")
+        st.caption("Adjuntá el PDF original emitido en ARCA. Es obligatorio para guardar la factura.")
         submitted = st.form_submit_button("Guardar factura en cuenta corriente", type="primary")
         if submitted:
-            if importe <= 0:
+            if archivo is None:
+                st.error("Adjuntá el PDF original de la factura emitida en ARCA.")
+            elif not comp.strip():
+                st.error("Ingresá el número de comprobante del PDF.")
+            elif importe <= 0:
                 st.error("Ingresá un importe mayor a cero.")
             elif modo_fm == "Nuevo cliente ocasional" and not nuevo_nombre.strip():
                 st.error("Ingresá el nombre o razón social del cliente ocasional.")
@@ -2600,7 +2212,7 @@ with tabs[2]:
                 except Exception as e:
                     st.error(f"No se pudo guardar: {e}")
 
-with tabs[3]:
+with tabs[2]:
     st.subheader("Avisos de pago")
     periodo = st.date_input("Período", value=date.today().replace(day=1), key="av_periodo").replace(day=1)
     clientes_aviso = query_df("SELECT * FROM clientes WHERE activo=1 AND modalidad='Aviso de pago' AND tipo_cliente='Mensual' ORDER BY nombre")
@@ -2670,7 +2282,7 @@ with tabs[3]:
         avisos["saldo"] = avisos["saldo"].map(money)
     st.dataframe(avisos, use_container_width=True, hide_index=True)
 
-with tabs[4]:
+with tabs[3]:
     st.subheader("Registrar pago")
     clientes=get_clientes(True)
     with st.form("pago"):
@@ -2693,7 +2305,7 @@ with tabs[4]:
                 st.session_state["pago_guardado_msg"]=f"Pago de {money(imp)} registrado para {nom}. Saldo actualizado."
                 st.rerun()
 
-with tabs[5]:
+with tabs[4]:
     st.subheader("Trabajo extra / puntual")
     clientes=get_clientes(True)
     # Debe quedar fuera del formulario: los widgets dentro de st.form recién
@@ -2812,7 +2424,7 @@ with tabs[5]:
                 else:
                     st.success("Trabajo puntual registrado.")
 
-with tabs[6]:
+with tabs[5]:
     st.subheader("Clientes")
     st.info("Los clientes Ocasionales quedan fuera de los avisos mensuales, cualquiera sea su forma de cobro. Para CARAVONE u otro trabajo por única vez, cambiá el Tipo de cliente a Ocasional y guardá los cambios. Los avisos anteriores se eliminan individualmente desde Avisos de pago.")
     clientes=get_clientes(False)
@@ -2999,7 +2611,7 @@ with tabs[6]:
             st.success("Emisor habitual actualizado.")
             st.rerun()
 
-with tabs[7]:
+with tabs[6]:
     st.subheader("Ítems y leyendas de facturación")
     st.write("Guardá conceptos habituales para reutilizarlos al facturar.")
     with st.form("nuevo_item_facturacion"):
@@ -3018,7 +2630,7 @@ with tabs[7]:
                 st.rerun()
     st.dataframe(catalogo_items(), use_container_width=True, hide_index=True)
 
-with tabs[8]:
+with tabs[7]:
     st.subheader("Cuenta corriente")
     mov = query_df("""
     SELECT m.id,m.fecha,c.nombre cliente,m.tipo,m.descripcion,m.importe,m.periodo,m.comprobante,m.pdf_path
@@ -3072,7 +2684,7 @@ with tabs[8]:
     else:
         st.success("No se detectan movimientos exactamente duplicados.")
 
-with tabs[9]:
+with tabs[8]:
     st.subheader("Exportar a Excel")
     tipo_exportacion=st.radio(
         "¿Qué querés exportar?",
@@ -3192,160 +2804,17 @@ with tabs[9]:
 
 
 
-with tabs[10]:
-    st.subheader("ARCA · Facturación electrónica real")
-    st.caption("Conector WSAA + WSFEv1. La app sólo emite si la configuración fiscal y las credenciales del CUIT están completas.")
-
-    if not app_password_configurada():
-        st.error("Antes de habilitar PRODUCCIÓN configurá `app_password` en Secrets. Esta app está publicada en Internet y no es seguro emitir sin acceso privado.")
-    else:
-        st.success("Acceso privado de la app configurado.")
-
-    emis = get_emisores(False)
-    if len(emis):
-        st.markdown("#### Emisores")
-        show_cols = [c for c in ["id","nombre","cuit","regimen_iva","punto_venta","ambiente_arca","activo"] if c in emis.columns]
-        st.dataframe(emis[show_cols], use_container_width=True, hide_index=True)
-
-        em_labels = {emisor_label(r): int(r["id"]) for _, r in emis.iterrows()}
-        ec = st.selectbox("Emisor a configurar", list(em_labels.keys()), key="arca_cfg_emisor")
-        current = emis[emis["id"] == em_labels[ec]].iloc[0]
-
-        st.markdown("##### Configuración del emisor")
-        st.info("Este emisor está fijado como Responsable Monotributo y sólo puede emitir Factura C.")
-        a1, a2 = st.columns(2)
-        pv = a1.number_input("Punto de venta WSFE", min_value=1, value=int(current.get("punto_venta") or 1), step=1, key="arca_pv")
-        amb_opts = ["HOMOLOGACION", "PRODUCCION"]
-        amb_current = str(current.get("ambiente_arca") or "HOMOLOGACION").upper()
-        ambiente = a2.selectbox("Ambiente", amb_opts, index=amb_opts.index(amb_current) if amb_current in amb_opts else 0, key="arca_amb")
-
-        a3, a4 = st.columns(2)
-        domicilio_fiscal = a3.text_input("Domicilio fiscal", value=str(current.get("domicilio_fiscal") or ""), key=f"arca_dom_fiscal_{int(em_labels[ec])}")
-        iibb = a4.text_input("Ingresos Brutos (opcional)", value=str(current.get("ingresos_brutos") or ""), key="arca_iibb")
-        ini_txt = str(current.get("inicio_actividades") or "")
-        try:
-            ini_default = datetime.strptime(ini_txt, "%Y-%m-%d").date() if ini_txt else date.today()
-        except Exception:
-            ini_default = date.today()
-        inicio_act_txt = st.text_input(
-            "Inicio de actividades (DD/MM/AAAA)",
-            value=ini_default.strftime("%d/%m/%Y"),
-            key=f"arca_ini_configurado_{int(em_labels[ec])}",
-            help="Escribí la fecha completa, por ejemplo 01/03/2010. Se permiten años desde 1900.",
-        )
-        inicio_act = None
-        try:
-            inicio_act = datetime.strptime(inicio_act_txt.strip(), "%d/%m/%Y").date()
-            if not date(1900, 1, 1) <= inicio_act <= date(2100, 12, 31):
-                inicio_act = None
-        except ValueError:
-            pass
-        if inicio_act is None:
-            st.error("Ingresá una fecha válida en formato DD/MM/AAAA, entre 1900 y 2100.")
-
-        if st.button("Guardar configuración del emisor", key="arca_guardar_cfg", disabled=inicio_act is None):
-            execute("""UPDATE emisores SET condicion_iva='Responsable Monotributo',punto_venta=?,domicilio_fiscal=?,
-                       ingresos_brutos=?,inicio_actividades=?,regimen_iva='RESPONSABLE_MONOTRIBUTO',
-                       iva_alicuota=0,ambiente_arca=?,precios_incluyen_iva=1 WHERE id=?""",
-                    (int(pv), domicilio_fiscal.strip() or None, iibb.strip() or None,
-                     inicio_act.isoformat(), ambiente, em_labels[ec]))
-            st.success("Configuración guardada.")
-            st.rerun()
-
-        cuit_current = str(current["cuit"])
-        st.markdown("##### Certificado ARCA")
-        if arca_configurada_para(cuit_current):
-            st.success(f"Certificado y clave privada cargados en Secrets para {cuit_current}.")
-        else:
-            st.warning(f"Todavía no hay certificado/clave privada cargados para {cuit_current}.")
-            if st.button("Generar clave privada + CSR para este CUIT", key="arca_gen_csr"):
-                try:
-                    key_bytes, csr_bytes = generar_clave_y_csr(cuit_current, str(current["nombre"]), "gestion-sysgroup")
-                    st.session_state["generated_arca_key"] = key_bytes
-                    st.session_state["generated_arca_csr"] = csr_bytes
-                except Exception as e:
-                    st.error(str(e))
-            if st.session_state.get("generated_arca_key") and st.session_state.get("generated_arca_csr"):
-                st.warning("Guardá la clave privada en un lugar seguro. No la subas a GitHub ni la compartas.")
-                d1, d2 = st.columns(2)
-                d1.download_button("Descargar clave privada", st.session_state["generated_arca_key"], file_name=f"ARCA_{digits(cuit_current)}.key", mime="application/octet-stream")
-                d2.download_button("Descargar CSR", st.session_state["generated_arca_csr"], file_name=f"ARCA_{digits(cuit_current)}.csr", mime="application/pkcs10")
-
-        if st.button("Probar conexión con ARCA (sin emitir)", key="arca_test_conn"):
-            try:
-                ta, ptos = probar_conexion_arca(em_labels[ec])
-                st.success(f"Conexión correcta. Ticket WSAA obtenido; vence {ta.expiration_time}.")
-                if ptos:
-                    st.dataframe(pd.DataFrame(ptos), use_container_width=True, hide_index=True)
-                else:
-                    st.info("ARCA no devolvió puntos de venta para este certificado/CUIT.")
-            except Exception as e:
-                st.error(str(e))
-
-
-    st.divider()
-    st.markdown("#### Facturas preparadas / emitidas")
-    comps = query_df("""
-        SELECT a.id,a.fecha_emision,c.nombre cliente,
-               COALESCE(e.nombre,'Sin asignar') emisor,COALESCE(e.cuit,'') cuit_emisor,
-               a.periodo_texto,a.tipo_comprobante,a.punto_venta,a.numero_comprobante,a.total,a.estado_arca,a.cae,
-               a.pdf_path,a.email_enviado,a.email_enviado_a,a.email_enviado_en,a.arca_error,a.arca_observaciones
+with tabs[9]:
+    st.subheader("Historial del conector anterior")
+    st.warning("La emisión y el envío desde el conector están deshabilitados. Los estados históricos no acreditan validez fiscal: verificá los comprobantes en ARCA.")
+    historial = query_df("""
+        SELECT a.id,a.fecha_emision,c.nombre cliente,e.nombre emisor,
+               a.punto_venta,a.numero_comprobante,a.total,a.estado_arca,a.cae,
+               a.email_enviado,a.email_enviado_a,a.email_enviado_en
         FROM comprobantes_arca a
         JOIN clientes c ON c.id=a.cliente_id
         LEFT JOIN emisores e ON e.id=a.emisor_id
         ORDER BY a.id DESC
     """)
-    if len(comps):
-        filtro = st.selectbox("Filtrar por emisor", ["Todos"] + sorted(comps["emisor"].dropna().unique().tolist()), key="arca_filter")
-        vista = comps.copy()
-        if filtro != "Todos":
-            vista = vista[vista["emisor"] == filtro]
-        vista_display = vista.copy()
-        vista_display["total"] = vista_display["total"].map(money)
-        st.dataframe(vista_display, use_container_width=True, hide_index=True)
-
-        drafts = comps[comps["estado_arca"].fillna("BORRADOR").isin(["BORRADOR","RECHAZADA"])]
-        if len(drafts):
-            did = st.selectbox("Borrador a emitir", drafts["id"].tolist(), key="arca_draft_sel")
-            dr = drafts[drafts["id"] == did].iloc[0]
-            st.caption(f"{dr['cliente']} · {dr['emisor']} · {dr['tipo_comprobante']} · {money(dr['total'])}")
-            if st.button("EMITIR EN ARCA", type="primary", key="arca_emit_existing"):
-                ok, msg = emitir_comprobante_arca(int(did))
-                (st.success if ok else st.error)(msg)
-                if ok:
-                    st.rerun()
-    else:
-        st.info("Todavía no hay facturas preparadas.")
-
-    st.divider()
-    st.markdown("#### Correo automático")
-    st.write(f"**Remitente:** {MAIL_FROM} · **Asunto:** {MAIL_SUBJECT}")
-    st.text_area("Cuerpo predeterminado", value=MAIL_BODY, height=220, disabled=True, key="mail_body_preview")
-    if gmail_configurada():
-        st.success("Credencial privada de Gmail configurada.")
-    else:
-        st.warning("Falta configurar la credencial privada de Gmail. La factura puede emitirse en ARCA, pero no se enviará automáticamente hasta hacerlo.")
-
-    autorizadas = query_df("""
-        SELECT a.id,c.nombre cliente,c.email_facturacion,a.pdf_path,a.pdf_archivo_id,
-               a.email_enviado,a.email_enviado_a,a.email_enviado_en
-        FROM comprobantes_arca a JOIN clientes c ON c.id=a.cliente_id
-        WHERE a.estado_arca='AUTORIZADA'
-        ORDER BY a.id DESC
-    """)
-    if len(autorizadas):
-        sel_id = st.selectbox("Factura autorizada", autorizadas["id"].tolist(), key="mail_factura_sel")
-        rr = autorizadas[autorizadas["id"] == sel_id].iloc[0]
-        st.caption(f"Cliente: {rr['cliente']} · Email: {rr.get('email_facturacion') or 'sin configurar'}")
-        cdl, csend = st.columns(2)
-        pdf_bytes, pdf_name = leer_pdf_permanente(rr.get("pdf_archivo_id"), rr.get("pdf_path"))
-        if pdf_bytes:
-            cdl.download_button("Descargar PDF", data=pdf_bytes, file_name=pdf_name or f"factura_{sel_id}.pdf", mime="application/pdf", key=f"pdf_{sel_id}")
-        else:
-            cdl.info("PDF todavía no disponible")
-        if csend.button("Enviar / reenviar factura", key=f"send_{sel_id}"):
-            ok, msg = enviar_factura_por_email(int(sel_id))
-            (st.success if ok else st.error)(msg)
-
-    st.divider()
-    st.info("Secuencia fiscal implementada: WSAA → último comprobante → FECAESolicitar → CAE → PDF con QR → cuenta corriente → email. Para PRODUCCIÓN se requiere completar la habilitación/certificados de cada CUIT en ARCA.")
+    st.dataframe(historial, use_container_width=True, hide_index=True)
+    st.caption("Se conserva el historial para revisión. Para incorporar una factura válida utilizá Facturas PDF (ARCA).")
