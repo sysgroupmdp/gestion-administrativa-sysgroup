@@ -24,6 +24,21 @@ from pypdf import PdfReader
 def digits(value):
     return re.sub(r"\D", "", str(value or ""))
 
+# Condiciones frente al IVA utilizadas por los formularios de clientes.
+IVA_RECEPTOR_OPCIONES = {
+    "IVA Responsable Inscripto": 1,
+    "IVA Sujeto Exento": 4,
+    "Consumidor Final": 5,
+    "Responsable Monotributo": 6,
+    "Sujeto No Categorizado": 7,
+    "Proveedor del Exterior": 8,
+    "Cliente del Exterior": 9,
+    "IVA Liberado – Ley N° 19.640": 10,
+    "Monotributista Social": 13,
+    "IVA No Alcanzado": 15,
+    "Monotributo Trabajador Independiente Promovido": 16,
+}
+
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "control_cuentas.db"
 PDF_DIR = APP_DIR / "facturas"
