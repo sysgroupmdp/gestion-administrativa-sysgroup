@@ -2002,7 +2002,7 @@ SALDOS_CORTE = (
     ('DISTRISUPER S.R.L.', '30609249206', 0),
     ('EULOGIO CONDORI', None, 180000),
     ('FIDEICOMISO DAPROTIS 4156 MAR DEL PLATA', '30717979296', 0),
-    ('GALVAN', None, 2400000),
+    ('GALVAN', None, 240000),
     ('GAUTHIER WALTER', None, 460000),
     ('GEHIE GASTRONOMICA SRL (alito)', '30681375135', 170000),
     ('GENARO Y ANDRES DE STEFANO', '30500689826', 192000),
@@ -2067,6 +2067,11 @@ def aplicar_corte_saldos():
         pendientes = []
         for fila, (nombre, cuit, saldo) in enumerate(SALDOS_CORTE, 1):
             if fila in filas_aplicadas:
+                if nombre == "GALVAN":
+                    conn.execute("""
+                        UPDATE corte_saldos_20261118 SET saldo=?
+                        WHERE fila=? AND saldo=?
+                    """, (saldo, fila, 2400000))
                 continue
             nombre_normalizado = nombre_para_corte(nombre)
             nombres = {nombre_normalizado}
@@ -2088,6 +2093,25 @@ def aplicar_corte_saldos():
                 VALUES (?,?,?,?)
             """, (fila, cliente_id, saldo, ultimo_id))
             ids_aplicados.add(cliente_id)
+        clave_gestionar = "ajuste_gestionar_20261118_1715000"
+        if not conn.execute("SELECT valor FROM app_meta WHERE clave=?", (clave_gestionar,)).fetchone():
+            gestionar = [
+                r for r in clientes
+                if nombre_para_corte(r["nombre"]) == "gestionar seguridad e higiene s r l"
+                or nombre_para_corte(r["nombre"]) == "gestionar seguridad e higiene srl"
+            ]
+            if len(gestionar) == 1:
+                cliente_id = gestionar[0]["id"]
+                conn.execute("""
+                    INSERT INTO movimientos
+                        (fecha,cliente_id,tipo,descripcion,importe,periodo,comprobante,creado_en)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (FECHA_CORTE_SALDOS, cliente_id, "Ajuste", "Corrección de saldo informada",
+                      -1715000, "2026-11-01", "AJUSTE-GESTIONAR-20261118", datetime.now().isoformat()))
+                conn.execute("INSERT INTO app_meta(clave,valor) VALUES (?,?)",
+                             (clave_gestionar, str(cliente_id)))
+            else:
+                pendientes.append("GESTIONAR SEGURIDAD E HIGIENE S.R.L.")
         conn.commit()
         return pendientes
     except Exception:
