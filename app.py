@@ -1,6 +1,7 @@
 
 import streamlit as st
 import sqlite3
+import unicodedata
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -1985,16 +1986,142 @@ def delete_notice(movimiento_id):
     """Elimina únicamente un movimiento del tipo Aviso de pago."""
     execute("DELETE FROM movimientos WHERE id=? AND tipo='Aviso de pago'", (int(movimiento_id),))
 
-def balances_df():
-    return query_df("""
-    SELECT c.id, c.nombre, c.tipo_cliente, c.modalidad, c.honorario,
-           COALESCE(SUM(m.importe),0) AS saldo
+FECHA_CORTE_SALDOS = "2026-11-18"
+SALDOS_CORTE = (
+    ('ALTURAS MS MIRAMAR S.R.L', '30718579763', 0),
+    ('ANGELICO CORP', '30718290747', 1240000),
+    ('BARD ATILIO RENE', '20047463514', 240000),
+    ('BIOPARQUE BATAN 2023 S.A.', '30718359453', 490000),
+    ('CAPARARO', '23272137404', 170000),
+    ('COOK MASTER S.A.', '30708214368', 703000),
+    ('COOPERATIVA DE TRABAJO COOPECONS LTDA', '30717179680', 240000),
+    ('COOPERATIVA DE TRABAJO EL CHE LIMITADA', '33711078199', 0),
+    ('COOPERATIVA DE TRABAJO SEGUIMOS LUCHANDO LTDA', '30714199753', 0),
+    ('CRUZ GEORGE', None, 240000),
+    ('DIMES S.A.', '33715613439', 0),
+    ('DISTRISUPER S.R.L.', '30609249206', 0),
+    ('EULOGIO CONDORI', None, 180000),
+    ('FIDEICOMISO DAPROTIS 4156 MAR DEL PLATA', '30717979296', 0),
+    ('GALVAN', None, 2400000),
+    ('GAUTHIER WALTER', None, 460000),
+    ('GEHIE GASTRONOMICA SRL (alito)', '30681375135', 170000),
+    ('GENARO Y ANDRES DE STEFANO', '30500689826', 192000),
+    ('GRUPO BOREAS S.R.L.', '30714816981', 0),
+    ('GUSTAVO RIVERA PLOMERO', None, 0),
+    ('INFINIT', '30711262713', 0),
+    ('INVERSORA EN CONSTRUCCIONES DE COBO S.A.', '30711651280', 0),
+    ('JUAREZ CESAR', None, 570000),
+    ('JUNCADELLA', '30546969874', 380000),
+    ('LOGISMAR S.R.L.', '30708043636', 145000),
+    ('LUBRIEL SRL', '30711294704', 0),
+    ('MADRID', None, 230000),
+    ('MAGGI MARCELO Y MAGGI MAURICIO SOC …', '30688684028', 0),
+    ('MAGLIANO MARCELO', None, 0),
+    ('MANALER S.A.', '30716570440', 725000),
+    ('MONDEGO DA GUARDA S.A.', '30716517361', 0),
+    ('OBISPADO DE MAR DEL PLATA', '30542337555', 0),
+    ('OESTE (LAURA FARIAS)', '27149714826', 0),
+    ('PEZZANA DIEGO', '20259572453', 680000),
+    ('PROSEGUR S.A.', '30575170125', 275000),
+    ('RAMOS SANCHEZ ALCIDES', None, 450000),
+    ('RBC CONSTRUCCIONES', None, 400000),
+    ('ROCA 2936 MAR DEL PLATA S.A.', '30717026965', 0),
+    ('ROJAS MARTIN', None, 240000),
+    ('RUCANEDA S.A.', '30712269134', 406000),
+    ('SARAZOLA', None, 150000),
+    ('SINDICATO DE QUIMICOS', '30532700414', 0),
+    ('UP EXPLANADA S.A.', '33718243829', 0),
+    ('USAI ANALIA USAI GABRIELA USAI ESTEBAN S.H.', '33636629559', 0),
+
+)
+
+
+def nombre_para_corte(nombre):
+    texto = unicodedata.normalize("NFKD", nombre.casefold())
+    return " ".join(re.findall(r"[a-z0-9]+", "".join(
+        c for c in texto if not unicodedata.combining(c)
+    )))
+
+
+def aplicar_corte_saldos():
+    """Guarda los saldos informados como base de la cuenta corriente."""
+    conn = get_conn()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS corte_saldos_20261118 (
+                fila INTEGER PRIMARY KEY,
+                cliente_id BIGINT NOT NULL UNIQUE REFERENCES clientes(id),
+                saldo BIGINT NOT NULL,
+                ultimo_movimiento BIGINT NOT NULL
+            )
+        """)
+        if getattr(conn, "is_postgres", False):
+            conn.execute("LOCK TABLE corte_saldos_20261118 IN SHARE ROW EXCLUSIVE MODE")
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+        existentes = conn.execute("SELECT fila, cliente_id FROM corte_saldos_20261118").fetchall()
+        filas_aplicadas = {r["fila"] for r in existentes}
+        ids_aplicados = {r["cliente_id"] for r in existentes}
+        clientes = conn.execute("SELECT id, nombre, cuit FROM clientes").fetchall()
+        ultimo_id = conn.execute("SELECT COALESCE(MAX(id),0) n FROM movimientos").fetchone()["n"]
+        pendientes = []
+        for fila, (nombre, cuit, saldo) in enumerate(SALDOS_CORTE, 1):
+            if fila in filas_aplicadas:
+                continue
+            nombre_normalizado = nombre_para_corte(nombre)
+            nombres = {nombre_normalizado}
+            if nombre_normalizado == "juarez cesar":
+                nombres.add("juarez cesar jose")
+            coincidencias = [r for r in clientes if cuit and digits(r["cuit"]) == cuit]
+            if not coincidencias:
+                coincidencias = [
+                    r for r in clientes
+                    if nombre_para_corte(r["nombre"]) in nombres
+                    and (not cuit or not digits(r["cuit"]) or digits(r["cuit"]) == cuit)
+                ]
+            if len(coincidencias) != 1 or coincidencias[0]["id"] in ids_aplicados:
+                pendientes.append(nombre)
+                continue
+            cliente_id = coincidencias[0]["id"]
+            conn.execute("""
+                INSERT INTO corte_saldos_20261118 (fila, cliente_id, saldo, ultimo_movimiento)
+                VALUES (?,?,?,?)
+            """, (fila, cliente_id, saldo, ultimo_id))
+            ids_aplicados.add(cliente_id)
+        conn.commit()
+        return pendientes
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def movimientos_vigentes_sql():
+    return """
+        k.cliente_id IS NULL
+        OR CAST(m.fecha AS TEXT) > ?
+        OR (CAST(m.fecha AS TEXT) = ? AND m.id > k.ultimo_movimiento)
+    """
+
+
+def balances_df(cliente_id=None):
+    filtro = "c.id=?" if cliente_id is not None else "(c.activo=1 OR k.cliente_id IS NOT NULL)"
+    params = (FECHA_CORTE_SALDOS, FECHA_CORTE_SALDOS)
+    if cliente_id is not None:
+        params += (cliente_id,)
+    return query_df(f"""
+    SELECT c.id, c.nombre, c.tipo_cliente, c.modalidad, c.honorario, c.activo,
+           k.saldo AS saldo_corte,
+           COALESCE(k.saldo,0) + COALESCE(SUM(m.importe),0) AS saldo
     FROM clientes c
-    LEFT JOIN movimientos m ON m.cliente_id=c.id
-    WHERE c.activo=1
-    GROUP BY c.id,c.nombre,c.tipo_cliente,c.modalidad,c.honorario
+    LEFT JOIN corte_saldos_20261118 k ON k.cliente_id=c.id
+    LEFT JOIN movimientos m ON m.cliente_id=c.id AND ({movimientos_vigentes_sql()})
+    WHERE {filtro}
+    GROUP BY c.id,c.nombre,c.tipo_cliente,c.modalidad,c.honorario,c.activo,k.saldo
     ORDER BY saldo DESC, c.nombre
-    """)
+    """, params)
+
 
 def guardar_datos_fiscales_cliente(cliente_id, condicion_desc, documento=None, email=None):
     cond_id = IVA_RECEPTOR_OPCIONES.get(condicion_desc)
@@ -2045,6 +2172,7 @@ ensure_initial_data()
 ensure_emitters()
 apply_emitter_fiscal_details_20261001()
 ensure_invoice_items()
+clientes_corte_pendientes = aplicar_corte_saldos()
 
 st.title("S&S Group · Gestión Administrativa")
 st.caption("Clientes · Facturación · Cuenta corriente · Pagos · Avisos · Trabajos puntuales · PDF de ARCA")
@@ -2060,12 +2188,15 @@ tabs = st.tabs(["Panel","Facturas PDF (ARCA)","Avisos de pago","Pagos","Trabajos
 with tabs[0]:
     saldos = balances_df()
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Total por cobrar", money(saldos["saldo"].clip(lower=0).sum()))
-    c2.metric("Clientes activos", len(saldos))
+    cuentas_corte = saldos.loc[saldos["saldo_corte"].notna()]
+    c1.metric("Total por cobrar · clientes del corte", money(cuentas_corte["saldo"].clip(lower=0).sum()))
+    c2.metric("Clientes activos", int((saldos["activo"] == 1).sum()))
     c3.metric("Clientes con deuda", int((saldos["saldo"]>0).sum()))
     movs = query_df("SELECT COUNT(*) n FROM movimientos").iloc[0]["n"]
     c4.metric("Movimientos", int(movs))
-    st.caption("Base actualizada desde Control de cuentas(1).xlsx · saldo fuente: $ 14.217.700.")
+    st.caption("Saldos informados al 18/11/2026. El total corresponde a los clientes del corte. Los movimientos posteriores actualizan la cuenta corriente.")
+    if clientes_corte_pendientes:
+        st.warning("Clientes del corte sin coincidencia única: " + ", ".join(clientes_corte_pendientes))
     st.subheader("Estado por cliente")
     show = saldos.copy()
     # Compatibilidad defensiva con bases anteriores
@@ -2285,13 +2416,10 @@ with tabs[2]:
 
     st.divider()
     st.markdown("#### Estado de clientes con aviso de pago")
-    avisos = query_df("""
-      SELECT c.nombre,c.honorario,
-             COALESCE(SUM(m.importe),0) saldo
-      FROM clientes c LEFT JOIN movimientos m ON m.cliente_id=c.id
-      WHERE c.activo=1 AND c.modalidad='Aviso de pago' AND c.tipo_cliente='Mensual'
-      GROUP BY c.id,c.nombre,c.honorario ORDER BY c.nombre
-    """)
+    avisos = saldos.loc[
+        (saldos["activo"] == 1) & (saldos["modalidad"] == "Aviso de pago")
+        & (saldos["tipo_cliente"] == "Mensual"), ["nombre", "honorario", "saldo"]
+    ].sort_values("nombre").copy()
     if len(avisos):
         avisos["honorario"] = avisos["honorario"].map(money)
         avisos["saldo"] = avisos["saldo"].map(money)
@@ -2600,7 +2728,7 @@ with tabs[5]:
             fila_estado = todos_clientes[todos_clientes['id'] == cid_estado].iloc[0]
             esta_activo = bool(int(fila_estado['activo'] or 0))
             if esta_activo:
-                saldo_estado = query_df("SELECT COALESCE(SUM(importe),0) AS saldo FROM movimientos WHERE cliente_id=?", (cid_estado,))
+                saldo_estado = balances_df(cid_estado)
                 st.write(f"Saldo registrado: {money(float(saldo_estado.iloc[0]['saldo'] or 0))}")
                 confirmar_estado = st.checkbox("Confirmo archivar este cliente y retirarlo del panel activo", key=f"archivar_conf_{cid_estado}")
                 if st.button("Archivar cliente", disabled=not confirmar_estado, key="archivar_cliente_btn"):
@@ -2647,6 +2775,10 @@ with tabs[6]:
 
 with tabs[7]:
     st.subheader("Cuenta corriente")
+    st.dataframe(saldos[["nombre", "saldo"]].assign(
+        saldo=lambda datos: datos["saldo"].map(money)
+    ), use_container_width=True, hide_index=True)
+    st.caption("Historial de movimientos registrados.")
     mov = query_df("""
     SELECT m.id,m.fecha,c.nombre cliente,m.tipo,m.descripcion,m.importe,m.periodo,m.comprobante,m.pdf_path
     FROM movimientos m JOIN clientes c ON c.id=m.cliente_id
@@ -2749,14 +2881,23 @@ with tabs[8]:
             ].iloc[0]
             cliente_id_exportar=int(cliente_exportar["id"])
 
-            movimientos_cliente=query_df("""
+            cuenta = balances_df(cliente_id_exportar).iloc[0]
+            saldo_cliente = float(cuenta["saldo"])
+            movimientos_cliente=query_df(f"""
                 SELECT m.fecha,m.tipo,COALESCE(m.descripcion,'') descripcion,
                        m.importe,COALESCE(CAST(m.comprobante AS TEXT),'') comprobante
                 FROM movimientos m
-                WHERE m.cliente_id=?
+                LEFT JOIN corte_saldos_20261118 k ON k.cliente_id=m.cliente_id
+                WHERE m.cliente_id=? AND ({movimientos_vigentes_sql()})
                 ORDER BY m.fecha,m.id
-            """,(cliente_id_exportar,))
-            saldo_cliente=float(movimientos_cliente["importe"].sum()) if len(movimientos_cliente) else 0.0
+            """, (cliente_id_exportar, FECHA_CORTE_SALDOS, FECHA_CORTE_SALDOS))
+            if pd.notna(cuenta["saldo_corte"]):
+                apertura = pd.DataFrame([{
+                    "fecha": FECHA_CORTE_SALDOS, "tipo": "Saldo al corte",
+                    "descripcion": "Saldo informado", "importe": float(cuenta["saldo_corte"]),
+                    "comprobante": "",
+                }])
+                movimientos_cliente = pd.concat([apertura, movimientos_cliente], ignore_index=True)
 
             m1,m2=st.columns(2)
             m1.metric("Movimientos",len(movimientos_cliente))
